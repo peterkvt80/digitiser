@@ -28,22 +28,86 @@ chart to tune classification to your specific pencils.
 
 ### Required
 - Raspberry Pi 4 or 5 (or Pi Zero 2W with reduced preview framerate)
-- USB webcam or Pi Camera Module
+- Camera — see options below
 - Copy-stand or overhead mount to hold the camera above the sheet
 
-### Camera configuration
+### Camera options
 
-The default backend is **OpenCV (USB webcam)**. Edit `config.py` to change:
+#### Default: Android phone via IP Webcam + ADB (recommended)
+
+Any Android phone running the **IP Webcam** app (by Pavel Khlebovich) connected
+to the Pi via USB cable. No Wi-Fi needed — the Pi tunnels the connection over
+ADB automatically.
+
+The app has been tested with a **Huawei P9**, which delivers 12 MP stills
+(3968×2976) from `/photo.jpg` — significantly more resolution than a typical
+USB webcam, giving the digitiser more detail for OCR and colour classification.
+
+**One-time phone setup:**
+
+1. Install **IP Webcam** (Pavel Khlebovich) from the Google Play Store.
+2. Enable Developer Options: Settings → About Phone → tap **Build Number 7 times**.
+3. Enable USB Debugging: Settings → Developer Options → **USB Debugging ON**.
+4. Connect the phone to the Pi with a USB-C cable.
+5. On first connection, accept **"Allow USB debugging?"** on the phone.
+6. Open IP Webcam and configure:
+   - Photo settings → Resolution: **Maximum**
+   - Photo settings → Quality: **95**
+   - Port: **8080**
+   - Scroll to the bottom and tap **Start server**. Leave the app running.
+
+Set `CAMERA["backend"] = "ipwebcam"` in `config.py` (this is the default).
+The ADB port-forward is set up automatically each time the digitiser starts.
+
+**Verify the connection:**
+```bash
+adb devices        # should list your phone as 'device'
+```
+
+#### Alternative: USB webcam
+
+Any USB webcam via OpenCV. Lower resolution than the phone option but simpler
+setup — just plug in and set:
 
 ```python
 CAMERA = {
-    "backend": "opencv",    # "opencv" | "picamera2" | "auto" | "none"
+    "backend": "opencv",
     ...
 }
 ```
 
-Use `"picamera2"` only if a Pi Camera Module is physically connected.
-`"auto"` is unreliable when both picamera2 and a USB webcam are present.
+#### Alternative: Pi Camera Module
+
+A Pi Camera Module via libcamera/picamera2. Only available when a camera module
+is physically connected to the Pi's CSI port:
+
+```python
+CAMERA = {
+    "backend": "picamera2",
+    ...
+}
+```
+
+> **Note:** `"auto"` backend is unreliable when both picamera2 and another
+> camera source are present. Specify the backend explicitly in production.
+
+### Camera configuration
+
+Edit `config.py` to match your setup:
+
+```python
+CAMERA = {
+    "backend":        "ipwebcam",   # "ipwebcam" | "opencv" | "picamera2" | "none"
+    "ipwebcam_port":  8080,         # must match the port set in the app
+    "autofocus_wait": 1.2,          # seconds to wait after triggering AF
+    "capture_width":  3968,         # informational for ipwebcam (phone delivers full sensor)
+    "capture_height": 2976,
+    "preview_width":  1280,
+    "preview_height": 960,
+    "rotation":       0,            # 0, 90, 180, or 270
+    "warmup_seconds": 1.5,
+}
+```
 
 ### Optional I/O
 
@@ -95,6 +159,7 @@ sudo apt install -y \
     python3-tk \
     python3-pip \
     python3-venv \
+    adb \
     i2c-tools \
     fonts-dejavu-mono
 ```
@@ -105,7 +170,20 @@ For Pi Camera Module support also install:
 sudo apt install -y libcamera-apps
 ```
 
-### 2. Enable I2C (for the LCD panel)
+### 2. ADB udev rules (so the Pi can talk to Android without root)
+
+```bash
+# Huawei vendor ID is 0x12d1 — adjust for other brands
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0666", GROUP="plugdev"' \
+  | sudo tee /etc/udev/rules.d/51-android.rules
+sudo chmod a+r /etc/udev/rules.d/51-android.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG plugdev "$USER"
+```
+
+Log out and back in for group membership to take effect.
+
+### 3. Enable I2C (for the LCD panel)
 
 ```bash
 sudo raspi-config nonint do_i2c 0
@@ -113,7 +191,7 @@ sudo raspi-config nonint do_i2c 0
 
 A reboot is required. Confirm with `i2cdetect -y 1`.
 
-### 3. Create the virtual environment
+### 4. Create the virtual environment
 
 On Raspberry Pi OS Bookworm the system Python is externally managed.
 The `--system-site-packages` flag gives the venv access to `python3-tk`
@@ -124,7 +202,7 @@ cd teletext_app
 python3 -m venv --system-site-packages venv
 ```
 
-### 4. Activate the virtual environment
+### 5. Activate the virtual environment
 
 ```bash
 source venv/bin/activate
@@ -132,7 +210,7 @@ source venv/bin/activate
 
 Add to `~/.bashrc` to activate automatically on login.
 
-### 5. Install Python dependencies
+### 6. Install Python dependencies
 
 ```bash
 pip install --upgrade pip
@@ -157,11 +235,12 @@ pip install RPi.GPIO
 # picamera2 is available via --system-site-packages; no pip install needed
 ```
 
-### 6. Verify
+### 7. Verify
 
 ```bash
 python3 -c "import cv2, PIL, pytesseract; print('OK')"
 tesseract --version
+adb version
 ```
 
 ### Automated installer
@@ -313,15 +392,17 @@ All settings are in `config.py`. Key values:
 
 ```python
 CAMERA = {
-    "backend": "opencv",       # camera backend
-    "rotation": 0,             # 0, 90, 180, 270
+    "backend":        "ipwebcam",   # default — Android phone via IP Webcam + ADB
+    "ipwebcam_port":  8080,
+    "autofocus_wait": 1.2,
+    "rotation":       0,            # 0, 90, 180, 270
 }
 
 DIGITISER = {
-    "empty_brightness_threshold": 245,   # cells brighter than this = blank
+    "empty_brightness_threshold": 190,   # cells brighter than this = blank
     "min_saturation": 12,                # HSV saturation floor for ink detection
     "dark_value_threshold": 160,         # HSV value below this = dark ink
-    "header_line": "        BLOCK PARTY 26 Pmpp     %H:%M.%S",
+    "header_line": "BLOCK PARTY 26",
     "template_params": {
         "aruco_dict": "DICT_4X4_50",
         "corner_ids": [0, 1, 2, 3],      # TL, TR, BR, BL
@@ -341,7 +422,7 @@ RENDERER = {
 teletext_app/
 ├── main.py          Entry point
 ├── config.py        All pin / CV / LCD settings
-├── camera.py        Camera abstraction (picamera2 / OpenCV / none)
+├── camera.py        Camera abstraction (IP Webcam / picamera2 / OpenCV / none)
 ├── hardware.py      GPIO buttons, relay, indicator LEDs
 ├── lcd.py           2×32 LCD manager (RPLCD / I2C)
 ├── template.py      Template sheet generator (run once to print)
@@ -355,4 +436,4 @@ teletext_app/
 ```
 
 Gallery: `~/digitiser_gallery/`
-Log: `~/digitiser.log`
+Log: `~/tdi620_digitiser.log`
