@@ -45,13 +45,9 @@ CALIB_COLOUR_MAP = {
 # ── Text content ──────────────────────────────────────────────────────────────
 TITLE_TEXT = "MAKE YOUR OWN TELETEXT PAGE"
 INSTRUCTIONS = [
-    "• Draw with red, green, yellow, dark blue, light blue or purple pencils.",
-    "• Use 1 colour per rectangle.",
-    "• No tiny details (they get lost).",
-    "• Leave the background blank.",
-    "• We will colour it black later.",
-    "• Write 1 letter per rectangle.",
-    "• Use a black pencil for letters.",
+    "• Draw with red, green, yellow, dark blue, light blue or purple pencils. Leave one space between colour changes.",
+    "• Write 1 letter per rectangle with a black pencil.",
+    "• Teletext has a black background. Don't colour it in. We will do that for you.",
 ]
 
 # Write-in fields drawn below the instructions in the left panel.

@@ -5,11 +5,11 @@ Pipeline
 --------
 1. Detect four 4×4 ArUco corner markers → four grid corners
 2. Perspective-warp grid region to 800×480
-3. Pre-classify every cell as EMPTY | TEXT | GRAPHICS
+3. Pre-classify every cell as EMPTY | TEXT | GRAPHICS | WHITE_GFX
    (only TEXT cells run Tesseract — large speed gain)
 4. Per-cell mid-row mode detection (ALPHA ↔ GRAPHICS)
 5. Encode each row: control codes into user-left empty gaps,
-   OCR for text, sixel-sample for graphics
+   OCR for text, sixel-sample for graphics/white_gfx
 6. Emit OL,0 header + OL,1..24 rows with ESC-encoded control codes
 
 TTI encoding
@@ -19,9 +19,28 @@ TTI encoding
 
 Colour rules
 ------------
-  WHITE and BLACK are never emitted as control codes.
   NONE (unclassified / blank) is treated as empty background.
-  Only RED GREEN YELLOW BLUE MAGENTA CYAN trigger control codes.
+  Only RED GREEN YELLOW BLUE MAGENTA CYAN WHITE trigger graphics control codes.
+  BLACK is never emitted as a control code.
+
+White graphics (CELL_WHITE_GFX)
+--------------------------------
+  A cell shaded densely with an achromatic (grey/black) pencil — with no
+  colour saturation — is classified as CELL_WHITE_GFX.  The user draws the
+  outline of their graphic shape and fills it in; the sixel pattern is
+  decoded from the fill density, exactly like coloured graphics cells.
+
+  Detection gates (all must pass, checked after colour classification):
+    1. Low saturation: avg_s < white_gfx_max_saturation (default 40)
+       — rules out coloured pencils that happen to have high fill.
+    2. High fill fraction: dark pixels / total pixels >= white_gfx_fill_threshold
+       (default 0.30, i.e. 30%)
+       — rules out text strokes (typically 5–20% fill) and blank paper.
+    3. At least one sixel sub-cell has non-zero fill
+       — same empty-cell guard used for coloured graphics.
+
+  Emitted as ESC W (0x17 + 0x40 = 0x57 = 'W') white graphics control code,
+  followed by the decoded sixel character.
 
 Sixel encoding
 --------------
@@ -103,9 +122,10 @@ GRAPHICS_CODES = {
 SUPPRESS_CTRL_COLOURS = {"NONE", "BLACK"}   # never emit as control codes
 SUPPRESS_COLOURS      = {"NONE", "BLACK"}   # cells that produce no output
 
-CELL_EMPTY    = 0
-CELL_TEXT     = 1
-CELL_GRAPHICS = 2
+CELL_EMPTY     = 0
+CELL_TEXT      = 1
+CELL_GRAPHICS  = 2
+CELL_WHITE_GFX = 3   # achromatic dense-fill → white graphics control code
 
 _MIN_MODE_RUN = 3   # minimum consecutive cells to commit to a mode switch
 
@@ -167,8 +187,8 @@ def digitise_full(pil_image: Image.Image, config: dict,
     ``scan_data`` is a list of 24 rows, each a list of 40 per-cell dicts::
 
         {
-          "cell_type":    CELL_EMPTY | CELL_TEXT | CELL_GRAPHICS,
-          "colour":       str  e.g. "RED", "NONE",
+          "cell_type":    CELL_EMPTY | CELL_TEXT | CELL_GRAPHICS | CELL_WHITE_GFX,
+          "colour":       str  e.g. "RED", "WHITE", "NONE",
           "mode":         "ALPHA" | "GRAPHICS",
           "ocr_char":     str  — character written to TTI (space if empty),
           "sixel_char":   str  — raw sixel character (graphics cells only),
@@ -553,65 +573,6 @@ def _classify_cell_type(patch_grey, sc, sr, sixel_thresh, gfx_fill_thresh):
 # ─────────────────────────────────────────────────────────────────────────────
 # Sixel decoding
 # ─────────────────────────────────────────────────────────────────────────────
-# Grid-line suppression
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _suppress_cell_grid_lines(patch_rgb: np.ndarray,
-                               border_px: int = 2) -> np.ndarray:
-    """
-    Remove printed grid-line bleed from a single cell patch.
-
-    The template grid lines are printed along cell boundaries.  After
-    perspective warping, the outermost 1-2 pixel rows/columns of every
-    cell patch contain dark grey ink from those lines.  These pixels:
-
-    * Dilute the saturation mean of coloured cells, weakening colour
-      detection.
-    * Inflate ``lum_spread`` and lower ``lum_min`` of blank cells,
-      causing false TEXT promotions.
-    * Add spurious dark pixels to sixel sub-cell fill counts at the
-      top/bottom/left/right edges of each sub-cell.
-
-    Strategy
-    --------
-    Replace the outermost ``border_px`` rows and columns of the patch
-    with the per-channel median of the interior region.  The interior
-    median is robust to partial pencil fill and to the colour of that
-    fill, so a coloured cell ends up with its actual pencil colour on the
-    edges rather than a dark grey grid line.
-
-    This operation is purely local to each cell patch.  Letter strokes
-    are in the *interior* of cells, not on the edges, so they are
-    completely unaffected.  Blank cells end up uniformly paper-coloured;
-    coloured cells end up uniformly pencil-coloured right to the edge.
-
-    Parameters
-    ----------
-    patch_rgb : np.ndarray  (H, W, 3) uint8  — RGB cell crop
-    border_px : int  — number of pixels to replace on each edge (default 2)
-
-    Returns
-    -------
-    Cleaned patch, same shape and dtype as input.
-    """
-    h, w = patch_rgb.shape[:2]
-    min_interior = 2 * border_px + 2
-    if h < min_interior or w < min_interior:
-        return patch_rgb   # patch too small to inset safely
-
-    interior = patch_rgb[border_px:h - border_px, border_px:w - border_px]
-    med = np.median(interior.reshape(-1, 3), axis=0).astype(np.uint8)
-
-    cleaned = patch_rgb.copy()
-    cleaned[:border_px, :]      = med   # top strip
-    cleaned[h - border_px:, :]  = med   # bottom strip
-    cleaned[:, :border_px]      = med   # left strip
-    cleaned[:, w - border_px:]  = med   # right strip
-
-    return cleaned
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _decode_sixels(grey, y0, y1, x0, x1, cw, ch, sc, sr, sixel_thresh) -> str:
     """
@@ -724,17 +685,6 @@ def _process_grid(warped: np.ndarray, config: dict,
                         pg = pg[r0:r1, c0:c1]
                         pr = pr[r0:r1, c0:c1]
 
-            # ── Grid-line suppression ─────────────────────────────────────────
-            # Replace the outermost border_px rows/columns of the cell patch
-            # with the interior median, erasing printed grid-line bleed before
-            # any classifier sees the pixels.  This is done after the outer-
-            # border inset guard (which trims edge-cell patches) so the two
-            # mechanisms are additive rather than redundant.
-            gl_border = config.get("grid_line_suppress_px", 2)
-            if gl_border > 0 and pr.shape[0] > gl_border * 2 + 2:
-                pr = _suppress_cell_grid_lines(pr, border_px=gl_border)
-                pg = cv2.cvtColor(pr, cv2.COLOR_RGB2GRAY)
-
             # ── Three-way cell classifier ─────────────────────────────────────
             #
             # Priority order (matches user measurements):
@@ -771,6 +721,51 @@ def _process_grid(warped: np.ndarray, config: dict,
                     cell_type.append(CELL_GRAPHICS)
                     cell_colour.append(colour)
                     cell_sixel.append(sixel_char)   # reused by _encode_row
+                continue
+
+            # ── White graphics check ──────────────────────────────────────────
+            # A cell shaded with an achromatic (grey/black) pencil — no colour
+            # saturation but high fill fraction — is white graphics.  Checked
+            # AFTER the colour classifier (which handles saturation > 40) so
+            # there is no overlap: a coloured cell never reaches this gate.
+            #
+            # Gates:
+            #   1. Low mean saturation of ink pixels (avg_s < white_gfx_max_sat)
+            #      — already guaranteed by _classify_colour returning NONE, but
+            #      we re-check explicitly for clarity and configurability.
+            #   2. Overall dark-pixel fill fraction >= white_gfx_fill_threshold
+            #      — separates dense shading from text strokes (5-20% fill).
+            #   3. At least one sixel sub-cell non-zero — same empty-cell guard
+            #      used for coloured cells.
+            wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.30)
+            wgfx_max_sat     = config.get("white_gfx_max_saturation", 40)
+
+            # Compute fill fraction and mean saturation on the (possibly inset /
+            # grid-line-suppressed) patch.
+            total_px   = pg.size
+            dark_px    = int((pg < sixel_thresh).sum())
+            fill_frac  = dark_px / max(1, total_px)
+
+            hsv_pr = cv2.cvtColor(pr, cv2.COLOR_RGB2HSV)
+            s_pr   = hsv_pr[:, :, 1].astype(np.float32)
+            avg_s  = float(s_pr.mean())
+
+            if fill_frac >= wgfx_fill_thresh and avg_s < wgfx_max_sat:
+                sixel_char = _decode_sixels(
+                    grey, y0, y1, x0c, x1c, cw, ch, sc, sr, sixel_thresh
+                )
+                if ord(sixel_char) == 0x20:   # all sixels zero → treat as empty
+                    log.debug("R%d C%d: white_gfx fill=%.0f%% but all sixels zero → EMPTY",
+                              row, col, fill_frac * 100)
+                    cell_type.append(CELL_EMPTY)
+                    cell_colour.append("NONE")
+                    cell_sixel.append(" ")
+                else:
+                    log.debug("R%d C%d: WHITE_GFX fill=%.0f%% avg_s=%.0f",
+                              row, col, fill_frac * 100, avg_s)
+                    cell_type.append(CELL_WHITE_GFX)
+                    cell_colour.append("WHITE")
+                    cell_sixel.append(sixel_char)
                 continue
 
             # Step B: spread separates text from blank.
@@ -892,7 +887,7 @@ def _process_grid(warped: np.ndarray, config: dict,
             # (always ' '/0x20 for non-GRAPHICS) so the inspector shows exactly
             # what went into the TTI with no independent recomputation.
             ct = cell_type[col]
-            if ct == CELL_GRAPHICS:
+            if ct in (CELL_GRAPHICS, CELL_WHITE_GFX):
                 sixel_char   = cell_sixel[col]
                 sixel_code   = ord(sixel_char)
                 # Reconstruct subcell fill fractions for inspector display only
@@ -1038,6 +1033,7 @@ def _assign_cell_modes(cell_type, cell_colour, explicit_mode_at, COLS):
 
     Rule (mirrors the reference analyser):
       - CELL_GRAPHICS with a real colour → GRAPHICS mode
+      - CELL_WHITE_GFX                  → GRAPHICS mode (white graphics)
       - CELL_TEXT or CELL_EMPTY         → ALPHA mode
     Explicit [GFX]/[ALF] annotations override.
 
@@ -1050,6 +1046,8 @@ def _assign_cell_modes(cell_type, cell_colour, explicit_mode_at, COLS):
     for col in range(COLS):
         if col in explicit_mode_at:
             modes.append(explicit_mode_at[col])
+        elif cell_type[col] == CELL_WHITE_GFX:
+            modes.append("GRAPHICS")
         elif (cell_type[col] == CELL_GRAPHICS and
               cell_colour[col] not in SUPPRESS_COLOURS):
             modes.append("GRAPHICS")
@@ -1118,7 +1116,7 @@ def _encode_row(warped, grey, warped_pil,
             # A space means Tesseract found nothing at this column.
             ch_str = ocr_chars.get(col, " ") or " "
             out_chars[col] = ch_str
-        elif mode == "GRAPHICS":
+        elif ct in (CELL_GRAPHICS, CELL_WHITE_GFX) and mode == "GRAPHICS":
             # Use the sixel char computed (and validated) during Step 1.
             # Do NOT call _decode_sixels again — its adaptive threshold can
             # differ from the Step 1 call and produce a different result.
@@ -1161,8 +1159,8 @@ def _encode_row(warped, grey, warped_pil,
         if ct == CELL_EMPTY or cn in SUPPRESS_COLOURS:
             continue
 
-        # GRAPHICS cell — emit colour code if state has changed
-        tgt_colour = cn
+        # GRAPHICS or WHITE_GFX cell — emit colour code if state has changed
+        tgt_colour = cn   # "RED", "GREEN", … or "WHITE" for white-gfx
         if mode != current_mode or tgt_colour != current_colour:
             _place_code(out_chars, col, _esc(GRAPHICS_CODES.get(tgt_colour, 0x17)))
             current_mode   = mode

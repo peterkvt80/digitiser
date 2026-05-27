@@ -132,16 +132,22 @@ DIGITISER = {
     "noise_spread_limit": 50,  # spread below this → EMPTY (dot-grid noise gate)
     "text_min_lum":     100,   # cell min-luminance must be below this → TEXT
 
-    # Grid-line suppression.  The printed template grid lines bleed into the
-    # outermost pixels of every warped cell patch.  Setting this to N replaces
-    # the outermost N pixel rows/columns of each cell with the interior median
-    # before any colour or text classifier runs.  This removes saturation
-    # dilution on coloured cells, false lum-spread on blank cells, and spurious
-    # dark pixels at sixel sub-cell edges.  Set to 0 to disable.
-    # 2px is correct for the standard template printed at A4 / 300 DPI and
-    # warped to 1600×960; increase to 3 only if the camera angle is steep
-    # enough that lines bleed more than 2px after warping.
-    "grid_line_suppress_px": 2,
+    # White graphics detection.
+    # A cell shaded densely with an achromatic pencil (no colour saturation)
+    # is classified as CELL_WHITE_GFX and emits ESC W (white graphics) plus
+    # the decoded sixel pattern.  The user draws the outline of their shape
+    # and fills it in; the software decides which sixel bits fire.
+    #
+    # white_gfx_fill_threshold : fraction of cell pixels below sixel_fill_threshold
+    #     that must be dark to qualify.  30% separates dense shading from text
+    #     strokes (typically 5-20%) with a comfortable margin.  Increase toward
+    #     0.45 if text cells with heavy strokes are being promoted to white-gfx.
+    # white_gfx_max_saturation : mean HSV saturation of the cell must be below
+    #     this to confirm the ink is achromatic.  40 sits cleanly between
+    #     pencil grey (~15-25) and the dimmest coloured pencil that passes
+    #     _classify_colour (avg_s ~54+).  Do not raise above 50.
+    "white_gfx_fill_threshold": 0.30,
+    "white_gfx_max_saturation":   40,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
     # cv2.rectangle which centres the stroke on the boundary) bleeds its inner

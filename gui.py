@@ -1356,7 +1356,7 @@ class _CellInspector(tk.Toplevel):
         "BLACK":   "#333333",
         "NONE":    "#222222",
     }
-    _CELL_TYPE_LABEL = {0: "EMPTY", 1: "TEXT", 2: "GRAPHICS"}
+    _CELL_TYPE_LABEL = {0: "EMPTY", 1: "TEXT", 2: "GRAPHICS", 3: "WHITE GFX"}
 
     COLS = 40
     ROWS = 24
@@ -1587,7 +1587,7 @@ class _CellInspector(tk.Toplevel):
         self._colour_var.set(colour)
 
         # Determine what the TTI char is for display
-        from digitiser import CELL_EMPTY, CELL_TEXT, CELL_GRAPHICS
+        from digitiser import CELL_EMPTY, CELL_TEXT, CELL_GRAPHICS, CELL_WHITE_GFX
         ocr_char   = d.get("ocr_char", " ")
         sixel_code = d["sixel_code"]
         sixel_hex  = f"0x{sixel_code:02X}"
@@ -1598,6 +1598,8 @@ class _CellInspector(tk.Toplevel):
             tti_char = "' '  (empty)"
         elif ct == CELL_TEXT:
             tti_char = f"'{ocr_char}'"
+        elif ct == CELL_WHITE_GFX:
+            tti_char = f"WHITE {sixel_hex} '{sixel_chr}'"
         else:
             tti_char = f"{sixel_hex} '{sixel_chr}'"
 
@@ -1766,7 +1768,7 @@ class _CellInspector(tk.Toplevel):
         if r["row"] != self._sel_row or r["col"] != self._sel_col:
             return   # stale result from a previous click
 
-        from digitiser import CELL_EMPTY, CELL_TEXT, CELL_GRAPHICS
+        from digitiser import CELL_EMPTY, CELL_TEXT, CELL_GRAPHICS, CELL_WHITE_GFX
 
         # ── Magnified view ────────────────────────────────────────────────────
         photo = ImageTk.PhotoImage(r["cell_mag"])
@@ -1792,6 +1794,8 @@ class _CellInspector(tk.Toplevel):
             tti_char = "' '  (empty)"
         elif r["cell_type"] == CELL_TEXT:
             tti_char = f"'{ocr_char}'"
+        elif r["cell_type"] == CELL_WHITE_GFX:
+            tti_char = f"WHITE {sixel_hex} '{sixel_chr}'"
         else:
             tti_char = f"{sixel_hex} '{sixel_chr}'"
 
