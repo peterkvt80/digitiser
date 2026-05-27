@@ -553,6 +553,65 @@ def _classify_cell_type(patch_grey, sc, sr, sixel_thresh, gfx_fill_thresh):
 # ─────────────────────────────────────────────────────────────────────────────
 # Sixel decoding
 # ─────────────────────────────────────────────────────────────────────────────
+# Grid-line suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _suppress_cell_grid_lines(patch_rgb: np.ndarray,
+                               border_px: int = 2) -> np.ndarray:
+    """
+    Remove printed grid-line bleed from a single cell patch.
+
+    The template grid lines are printed along cell boundaries.  After
+    perspective warping, the outermost 1-2 pixel rows/columns of every
+    cell patch contain dark grey ink from those lines.  These pixels:
+
+    * Dilute the saturation mean of coloured cells, weakening colour
+      detection.
+    * Inflate ``lum_spread`` and lower ``lum_min`` of blank cells,
+      causing false TEXT promotions.
+    * Add spurious dark pixels to sixel sub-cell fill counts at the
+      top/bottom/left/right edges of each sub-cell.
+
+    Strategy
+    --------
+    Replace the outermost ``border_px`` rows and columns of the patch
+    with the per-channel median of the interior region.  The interior
+    median is robust to partial pencil fill and to the colour of that
+    fill, so a coloured cell ends up with its actual pencil colour on the
+    edges rather than a dark grey grid line.
+
+    This operation is purely local to each cell patch.  Letter strokes
+    are in the *interior* of cells, not on the edges, so they are
+    completely unaffected.  Blank cells end up uniformly paper-coloured;
+    coloured cells end up uniformly pencil-coloured right to the edge.
+
+    Parameters
+    ----------
+    patch_rgb : np.ndarray  (H, W, 3) uint8  — RGB cell crop
+    border_px : int  — number of pixels to replace on each edge (default 2)
+
+    Returns
+    -------
+    Cleaned patch, same shape and dtype as input.
+    """
+    h, w = patch_rgb.shape[:2]
+    min_interior = 2 * border_px + 2
+    if h < min_interior or w < min_interior:
+        return patch_rgb   # patch too small to inset safely
+
+    interior = patch_rgb[border_px:h - border_px, border_px:w - border_px]
+    med = np.median(interior.reshape(-1, 3), axis=0).astype(np.uint8)
+
+    cleaned = patch_rgb.copy()
+    cleaned[:border_px, :]      = med   # top strip
+    cleaned[h - border_px:, :]  = med   # bottom strip
+    cleaned[:, :border_px]      = med   # left strip
+    cleaned[:, w - border_px:]  = med   # right strip
+
+    return cleaned
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _decode_sixels(grey, y0, y1, x0, x1, cw, ch, sc, sr, sixel_thresh) -> str:
     """
@@ -664,6 +723,17 @@ def _process_grid(warped: np.ndarray, config: dict,
                     if r1 > r0 + 2 and c1 > c0 + 2:
                         pg = pg[r0:r1, c0:c1]
                         pr = pr[r0:r1, c0:c1]
+
+            # ── Grid-line suppression ─────────────────────────────────────────
+            # Replace the outermost border_px rows/columns of the cell patch
+            # with the interior median, erasing printed grid-line bleed before
+            # any classifier sees the pixels.  This is done after the outer-
+            # border inset guard (which trims edge-cell patches) so the two
+            # mechanisms are additive rather than redundant.
+            gl_border = config.get("grid_line_suppress_px", 2)
+            if gl_border > 0 and pr.shape[0] > gl_border * 2 + 2:
+                pr = _suppress_cell_grid_lines(pr, border_px=gl_border)
+                pg = cv2.cvtColor(pr, cv2.COLOR_RGB2GRAY)
 
             # ── Three-way cell classifier ─────────────────────────────────────
             #

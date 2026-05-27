@@ -132,6 +132,17 @@ DIGITISER = {
     "noise_spread_limit": 50,  # spread below this → EMPTY (dot-grid noise gate)
     "text_min_lum":     100,   # cell min-luminance must be below this → TEXT
 
+    # Grid-line suppression.  The printed template grid lines bleed into the
+    # outermost pixels of every warped cell patch.  Setting this to N replaces
+    # the outermost N pixel rows/columns of each cell with the interior median
+    # before any colour or text classifier runs.  This removes saturation
+    # dilution on coloured cells, false lum-spread on blank cells, and spurious
+    # dark pixels at sixel sub-cell edges.  Set to 0 to disable.
+    # 2px is correct for the standard template printed at A4 / 300 DPI and
+    # warped to 1600×960; increase to 3 only if the camera angle is steep
+    # enough that lines bleed more than 2px after warping.
+    "grid_line_suppress_px": 2,
+
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
     # cv2.rectangle which centres the stroke on the boundary) bleeds its inner
     # half into the warped cell area.  On edge cells this dark intrusion inflates
