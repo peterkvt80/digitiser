@@ -7,11 +7,12 @@ name and a unique hatch pattern so the user can easily identify which box to
 colour with each pencil.
 
 Chart layout (A5 landscape):
-  [ArUco] [RED//] [GREEN\\] [YELLOW--] [BLUE||] [CYAN XX] [MAGENTA..] [WHITE  ]
+  [ArUco] [RED//] [GREEN\\] [YELLOW--] [BLUE||] [CYAN XX] [MAGENTA..] [WHITE//]
   ← marker ← 7 swatch boxes, each ~equal width, all labelled in black ────────
 
-The WHITE box is left blank — it confirms the paper reference and is
-not stored in the calibration result.
+All swatch boxes are optional — only fill in the colours whose pencils are
+scanning incorrectly.  Unfilled boxes are detected as uncoloured and skipped;
+their hue ranges fall back to the built-in defaults.
 
 Geometry is computed purely from module-level constants so it is always
 consistent between generate_chart() and calibrate_from_image() — no
@@ -69,7 +70,7 @@ HATCH_PATTERNS = {
     "BLUE":    ("vert",   14),   # vertical lines    ||||
     "CYAN":    ("cross",  18),   # cross-hatch       ####
     "MAGENTA": ("dots",   20),   # dot grid          ....
-    "WHITE":   (None,      0),   # blank — leave empty for user
+    "WHITE":   ("fwd",    28),   # sparse diagonal — fill with grey/white pencil
 }
 
 # Monochrome grey levels
@@ -176,7 +177,7 @@ def generate_chart(output_dir: Path = Path(".")) -> dict:
     canvas = np.ones((H, W), dtype=np.uint8) * GREY_BG
 
     # ── Title ─────────────────────────────────────────────────────────────────
-    cv2.putText(canvas, "TDI620 COLOUR CALIBRATION — colour each box with the named pencil",
+    cv2.putText(canvas, "TDI620 COLOUR CALIBRATION — only colour the boxes for pencils that scan incorrectly",
                 (margin, margin - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, GREY_LABEL, 1, cv2.LINE_AA)
 
@@ -222,7 +223,7 @@ def generate_chart(output_dir: Path = Path(".")) -> dict:
                     GREY_LABEL, thick, cv2.LINE_AA)
 
         # Instruction text inside the box (small, centred)
-        instr  = "colour in"
+        instr  = "optional"
         iw, ih = cv2.getTextSize(instr, font, 0.35, 1)[0]
         cv2.putText(canvas, instr,
                     (cx - iw // 2, y0 + box_h // 2 + ih // 2),
@@ -380,9 +381,6 @@ def calibrate_from_image(pil_image, gallery_dir: Path) -> dict:
     colours = geom["swatch_colours"]
 
     for i, colour_name in enumerate(colours):
-        if colour_name == "WHITE":
-            continue
-
         cx = int(swatch_cx_cy[i, 0])
         cy = int(swatch_cx_cy[i, 1])
 
@@ -400,7 +398,8 @@ def calibrate_from_image(pil_image, gallery_dir: Path) -> dict:
 
         hue_data = _sample_hue(patch)
         if hue_data is None:
-            log.warning("%s swatch appears uncoloured — skipping", colour_name)
+            # Box was left unfilled — silently skip; partial calibration is fine.
+            log.info("%s swatch not filled — will use default hue range", colour_name)
             continue
 
         mean_hue, spread = hue_data
@@ -415,8 +414,9 @@ def calibrate_from_image(pil_image, gallery_dir: Path) -> dict:
 
     if not calib:
         raise RuntimeError(
-            "No swatches could be calibrated.\n"
-            "Make sure each coloured box has been filled in with the pencil."
+            "No swatches were detected as filled in.\n"
+            "Colour in at least one box with the matching pencil and try again.\n"
+            "Tip: you only need to fill in the colours that are scanning incorrectly."
         )
 
     out_path = Path(gallery_dir) / CALIB_FILENAME

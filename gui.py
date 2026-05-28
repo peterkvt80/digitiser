@@ -403,6 +403,7 @@ class TeletextGUI(tk.Tk):
             ("RED",     "#ff0000"), ("GREEN",   "#00ff00"),
             ("YELLOW",  "#ffff00"), ("BLUE",    "#0000ff"),
             ("CYAN",    "#00ffff"), ("MAGENTA", "#ff00ff"),
+            ("WHITE",   "#ffffff"),
         ]
         for i, (name, hex_col) in enumerate(SWATCH_COLOURS):
             col_frame = tk.Frame(swatch_frame, bg=C["bg"])
@@ -428,9 +429,10 @@ class TeletextGUI(tk.Tk):
         # Brief instructions
         instr = (
             "1. Press GENERATE to print the calibration chart.\n"
-            "2. Colour each swatch with the matching pencil.\n"
+            "2. Colour ONLY the boxes for pencils that scan incorrectly.\n"
             "3. Place chart under camera — preview appears below.\n"
-            "4. Wait for camera to adjust, then press CAPTURE CHART."
+            "4. Wait for camera to adjust, then press CAPTURE CHART.\n"
+            "   Unfilled boxes keep their default hue range."
         )
         tk.Label(self._tab_calibrate, text=instr,
                  font=("Courier", 10), fg=C["text"], bg=C["bg"],
@@ -513,10 +515,11 @@ class TeletextGUI(tk.Tk):
                      for n, d in calib.items()]
             self._calib_result.config(text="\n".join(lines))
             self._update_calib_status()
-            self._set_status(f"Calibration complete — {len(calib)} colours sampled")
+            self._set_status(f"Calibration complete — {len(calib)} colour(s) sampled")
             messagebox.showinfo("Calibration Complete",
-                                f"Successfully calibrated {len(calib)} colours.\n"
-                                "These will be used for all future captures.")
+                                f"Successfully calibrated {len(calib)} colour(s).\n"
+                                "Any unfilled boxes will use default hue ranges.\n"
+                                "These settings will be used for all future captures.")
         except Exception as e:
             self._set_status(f"Calibration error: {e}")
             messagebox.showerror("Calibration Error", str(e))

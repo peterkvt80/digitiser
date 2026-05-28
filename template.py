@@ -31,7 +31,7 @@ GRID_BORDER_PX = 6
 # Six 2×2-cell rectangles, one per teletext colour, coloured in by the user.
 # The strip geometry is deterministic from the grid geometry so digitiser.py
 # can locate the rectangles without any extra file I/O.
-CALIB_COLOURS = ["RED", "GRE", "YEL", "BLU", "MAG", "CYA"]
+CALIB_COLOURS = ["RED", "GRE", "YEL", "BLU", "MAG", "CYA", "WHI"]
 CALIB_COLOUR_MAP = {
     # Full teletext colour name keyed by 3-letter label
     "RED": "RED",
@@ -40,14 +40,19 @@ CALIB_COLOUR_MAP = {
     "BLU": "BLUE",
     "MAG": "MAGENTA",
     "CYA": "CYAN",
+    "WHI": "WHITE",
 }
 
 # ── Text content ──────────────────────────────────────────────────────────────
 TITLE_TEXT = "MAKE YOUR OWN TELETEXT PAGE"
 INSTRUCTIONS = [
-    "• Draw with red, green, yellow, dark blue, light blue or purple pencils. Leave one space between colour changes.",
+    "• Draw with red, green, yellow, dark blue, light blue or purple pencils.",
     "• Write 1 letter per rectangle with a black pencil.",
     "• Teletext has a black background. Don't colour it in. We will do that for you.",
+    "• We will apply these teletext rules for you:",
+    "  Only 1 colour per rectangle.",
+    "  Each rectangle contains 6 squares.",
+    "  Leave one space between colour changes.",
 ]
 
 # Write-in fields drawn below the instructions in the left panel.
