@@ -187,23 +187,31 @@ def digitise_full(pil_image: Image.Image, config: dict,
     ``scan_data`` is a list of 24 rows, each a list of 40 per-cell dicts::
 
         {
-          "cell_type":    CELL_EMPTY | CELL_TEXT | CELL_GRAPHICS | CELL_WHITE_GFX,
-          "colour":       str  e.g. "RED", "WHITE", "NONE",
-          "mode":         "ALPHA" | "GRAPHICS",
-          "ocr_char":     str  — character written to TTI (space if empty),
-          "sixel_char":   str  — raw sixel character (graphics cells only),
-          "sixel_code":   int  — byte value of sixel_char,
-          "subcell_fill": list[float]  — 6 sub-cell fill fractions,
-          "bits":         int  — 6-bit sixel bitmask,
-          "mean_lum":     float,
-          "min_lum":      float,
-          "max_lum":      float,
-          "lum_spread":   float,
-          "mean_hue":     float,  # OpenCV 0-179
-          "mean_sat":     float,
-          "mean_val":     float,
-          "ink_pixels":   int,
-          "ink_pct":      float,
+          "cell_type":      CELL_EMPTY | CELL_TEXT | CELL_GRAPHICS | CELL_WHITE_GFX,
+          "colour":         str  e.g. "RED", "WHITE", "NONE",
+          "mode":           "ALPHA" | "GRAPHICS",
+          "ocr_char":       str  — character written to TTI (space if empty),
+          "sixel_char":     str  — raw sixel character (graphics cells only),
+          "sixel_code":     int  — byte value of sixel_char,
+          "subcell_fill":   list[float]  — 6 sub-cell fill fractions,
+          "bits":           int  — 6-bit sixel bitmask,
+          "sixel_colours":  list[str]  — per-sub-cell colour (6 entries),
+                            e.g. ["RED","RED","NONE","RED","NONE","NONE"]
+                            NONE = background / unset / paper.
+                            Only populated for CELL_GRAPHICS / CELL_WHITE_GFX;
+                            all-NONE for other cell types.
+          "sixel_bg_colour": str | None — secondary colour in the cell's
+                            two-colour palette, or None for single-colour cells.
+                            Only populated for CELL_GRAPHICS / CELL_WHITE_GFX.
+          "mean_lum":       float,
+          "min_lum":        float,
+          "max_lum":        float,
+          "lum_spread":     float,
+          "mean_hue":       float,  # OpenCV 0-179
+          "mean_sat":       float,
+          "mean_val":       float,
+          "ink_pixels":     int,
+          "ink_pct":        float,
         }
 
     Use this instead of ``digitise()`` when the Cell Inspector needs the
@@ -611,6 +619,201 @@ def _decode_sixels(grey, y0, y1, x0, x1, cw, ch, sc, sr, sixel_thresh) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sixel-level colour analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hue_distance(a: float, b: float) -> float:
+    """Angular distance between two OpenCV hues (0-179)."""
+    d = abs(a - b)
+    return min(d, 179.0 - d)
+
+
+def _colour_to_hue(name: str) -> "float | None":
+    """
+    Return the canonical OpenCV hue centre for a teletext colour name.
+    Returns None for NONE/BLACK/WHITE (achromatic — no meaningful hue).
+    """
+    return {
+        "RED":     0.0,
+        "YELLOW":  27.0,
+        "GREEN":   55.0,
+        "CYAN":    90.0,
+        "BLUE":    120.0,
+        "MAGENTA": 150.0,
+    }.get(name, None)
+
+
+def _nearest_colour(avg_h: float, candidates: "list[str]") -> str:
+    """
+    Return whichever name in ``candidates`` has the closest hue to ``avg_h``.
+    Candidates must all be chromatic (not NONE/BLACK/WHITE).
+    """
+    best, best_dist = candidates[0], float("inf")
+    for name in candidates:
+        h = _colour_to_hue(name)
+        if h is not None:
+            d = _hue_distance(avg_h, h)
+            if d < best_dist:
+                best_dist = d
+                best = name
+    return best
+
+
+def _classify_sixel_colours(
+    cell_rgb: np.ndarray,
+    grey_patch: np.ndarray,
+    bits: int,
+    cell_colour: str,
+    sc: int,
+    sr: int,
+    y0: int, y1: int,
+    x0c: int, x1c: int,
+    sixel_thresh: int,
+    config: dict,
+) -> "tuple[list[str], str | None]":
+    """
+    Classify the colour of each individual sixel sub-cell and determine the
+    cell's two-colour palette (foreground + background).
+
+    Teletext graphics cells are constrained to exactly two colours — the
+    foreground colour (set sub-cells) and the background colour (unset
+    sub-cells).  This function measures what colour each sub-cell actually
+    contains and enforces that constraint.
+
+    Parameters
+    ----------
+    cell_rgb   : (H,W,3) uint8 RGB patch of the full cell
+    grey_patch : (H,W)   uint8 greyscale patch of the full cell
+    bits       : 6-bit sixel bitmask already decoded by _decode_sixels
+    cell_colour: dominant colour already classified for the whole cell
+    sc, sr     : sixel columns (2) and rows (3)
+    y0,y1,x0c,x1c : absolute pixel coordinates of the cell in the warped image
+                    (used only so sub-cell patches are sliced from cell_rgb
+                     using relative offsets)
+    sixel_thresh : greyscale threshold for "dark pixel"
+    config     : DIGITISER config dict
+
+    Returns
+    -------
+    sixel_colours : list[str], length sc*sr
+        Per-sub-cell colour name.  Unset (background) sub-cells that contain
+        only paper/white return "NONE".  Every element is one of the teletext
+        colour names or "NONE".
+
+    bg_colour : str | None
+        The secondary colour found in the unset sub-cells, or None if all
+        sub-cells are the same colour (single-colour cell).
+
+    Algorithm
+    ---------
+    1.  For each of the 6 sub-cells, crop the RGB patch and run
+        _classify_colour on it.
+
+    2.  Collect all distinct non-NONE colours found across all sub-cells.
+
+    3.  Two-colour enforcement:
+          a. If only one distinct colour found → single-colour cell.
+             bg_colour = None.
+          b. If exactly two distinct colours → fg = cell_colour,
+             bg = the other one.
+          c. If >2 distinct colours (noise / mixed pencil strokes) →
+             keep cell_colour as fg; for every other colour, assign it to
+             whichever of fg or the most-common secondary is hue-nearest.
+             bg_colour = most-common secondary colour after reassignment.
+
+    4.  Re-label each sub-cell using only the resolved fg/bg pair.
+        Sub-cells that returned NONE are labelled as bg_colour (they are
+        paper, i.e. background).
+    """
+    h_cell = cell_rgb.shape[0]
+    w_cell = cell_rgb.shape[1]
+
+    sw = w_cell / sc
+    sh = h_cell / sr
+
+    # ── Step 1: classify each sub-cell ───────────────────────────────────────
+    raw_colours: list[str] = []
+    for bit_idx, (sy, sx) in enumerate([(r, c) for r in range(sr) for c in range(sc)]):
+        sub_x0 = int(sx * sw);       sub_x1 = int((sx + 1) * sw)
+        sub_y0 = int(sy * sh);       sub_y1 = int((sy + 1) * sh)
+        sub_rgb = cell_rgb[sub_y0:sub_y1, sub_x0:sub_x1]
+        if sub_rgb.size == 0:
+            raw_colours.append("NONE")
+            continue
+        colour = _classify_colour(sub_rgb, config)
+        raw_colours.append(colour)
+
+    # ── Step 2: gather distinct chromatic colours ─────────────────────────────
+    chromatic = [c for c in raw_colours if c != "NONE"]
+    if not chromatic:
+        # All sub-cells look like paper — treat everything as background
+        return ["NONE"] * (sc * sr), None
+
+    from collections import Counter
+    counts = Counter(chromatic)
+    distinct = list(counts.keys())
+
+    # ── Step 3: enforce two-colour constraint ─────────────────────────────────
+    if len(distinct) == 1:
+        # Single colour — straightforward
+        fg_colour = distinct[0]
+        bg_colour = None
+
+    elif len(distinct) == 2:
+        # Exactly two colours — fg is the cell's already-known dominant colour
+        # (keeps consistency with the rest of the pipeline).  If cell_colour
+        # isn't one of them (shouldn't happen, but guard anyway), use the
+        # most common.
+        fg_colour = cell_colour if cell_colour in distinct else counts.most_common(1)[0][0]
+        bg_colour = next(c for c in distinct if c != fg_colour)
+
+    else:
+        # >2 colours — noise or mixed pencil.
+        # fg = cell_colour (most common / already validated).
+        # For the secondary: pick the most-common non-fg colour.
+        fg_colour = cell_colour if cell_colour in counts else counts.most_common(1)[0][0]
+        non_fg = [(c, n) for c, n in counts.most_common() if c != fg_colour]
+        bg_colour = non_fg[0][0] if non_fg else None
+
+        # Reassign minority colours: map each to whichever of fg/bg is hue-nearest
+        if bg_colour is not None:
+            pair = [fg_colour, bg_colour]
+            pair_hues = [_colour_to_hue(p) for p in pair]
+            reassigned: dict[str, str] = {}
+            for c in distinct:
+                if c in (fg_colour, bg_colour):
+                    continue
+                c_hue = _colour_to_hue(c)
+                if c_hue is None:
+                    reassigned[c] = bg_colour
+                    continue
+                dists = [
+                    _hue_distance(c_hue, ph) if ph is not None else float("inf")
+                    for ph in pair_hues
+                ]
+                reassigned[c] = pair[0] if dists[0] <= dists[1] else pair[1]
+            raw_colours = [
+                reassigned.get(c, c) for c in raw_colours
+            ]
+
+    # ── Step 4: build final per-sub-cell colour list ──────────────────────────
+    # Sub-cells that returned NONE (paper/white, unset) become bg_colour.
+    # If bg_colour is None (single-colour cell) they stay NONE.
+    sixel_colours: list[str] = []
+    for c in raw_colours:
+        if c == "NONE":
+            sixel_colours.append(bg_colour if bg_colour is not None else "NONE")
+        else:
+            sixel_colours.append(c)
+
+    log.debug(
+        "_classify_sixel_colours: fg=%s bg=%s per_cell=%s",
+        fg_colour, bg_colour, sixel_colours,
+    )
+    return sixel_colours, bg_colour
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Grid processing — per-cell mid-row mode detection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -906,33 +1109,52 @@ def _process_grid(warped: np.ndarray, config: dict,
                     subcell_fill.append(frac)
                     if frac > SUBCELL_FILL_FRAC:
                         bits |= (1 << bit_idx)
+
+                # ── Per-sub-cell colour analysis ──────────────────────────────
+                # Run _classify_sixel_colours on the full cell RGB patch.
+                # This determines which colour each of the 6 sub-cells contains
+                # and resolves the two-colour palette (fg + bg).
+                sixel_colours, sixel_bg_colour = _classify_sixel_colours(
+                    cell_rgb_np,
+                    cell_grey_np,
+                    bits,
+                    cell_colour[col],
+                    sc, sr,
+                    y0, y1, x0c, x1c,
+                    sixel_thresh,
+                    config,
+                )
             else:
                 # Not a graphics cell — zero all sixel fields
-                sixel_char   = " "
-                sixel_code   = 0x20
-                subcell_fill = [0.0] * (sc * sr)
-                bits         = 0
+                sixel_char       = " "
+                sixel_code       = 0x20
+                subcell_fill     = [0.0] * (sc * sr)
+                bits             = 0
+                sixel_colours    = ["NONE"] * (sc * sr)
+                sixel_bg_colour  = None
 
             ocr = ocr_chars.get(col, " ") or " "
 
             row_cells.append({
-                "cell_type":    ct,
-                "colour":       cell_colour[col],
-                "mode":         cell_mode[col],
-                "ocr_char":     ocr if ct == CELL_TEXT else " ",
-                "sixel_char":   sixel_char,
-                "sixel_code":   sixel_code,
-                "subcell_fill": subcell_fill,
-                "bits":         bits,
-                "mean_lum":     mean_lum,
-                "min_lum":      min_lum,
-                "max_lum":      max_lum,
-                "lum_spread":   lum_spread,
-                "mean_hue":     mean_hue,
-                "mean_sat":     mean_sat,
-                "mean_val":     mean_val,
-                "ink_pixels":   int(ink_pixels),
-                "ink_pct":      float(ink_pct),
+                "cell_type":       ct,
+                "colour":          cell_colour[col],
+                "mode":            cell_mode[col],
+                "ocr_char":        ocr if ct == CELL_TEXT else " ",
+                "sixel_char":      sixel_char,
+                "sixel_code":      sixel_code,
+                "subcell_fill":    subcell_fill,
+                "bits":            bits,
+                "sixel_colours":   sixel_colours,
+                "sixel_bg_colour": sixel_bg_colour,
+                "mean_lum":        mean_lum,
+                "min_lum":         min_lum,
+                "max_lum":         max_lum,
+                "lum_spread":      lum_spread,
+                "mean_hue":        mean_hue,
+                "mean_sat":        mean_sat,
+                "mean_val":        mean_val,
+                "ink_pixels":      int(ink_pixels),
+                "ink_pct":         float(ink_pct),
             })
         scan_data.append(row_cells)
 

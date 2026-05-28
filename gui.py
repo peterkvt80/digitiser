@@ -1607,6 +1607,8 @@ class _CellInspector(tk.Toplevel):
             tti_char = f"{sixel_hex} '{sixel_chr}'"
 
         ct_label = self._CELL_TYPE_LABEL.get(ct, "?")
+        sixel_colours   = d.get("sixel_colours",   ["NONE"] * 6)
+        sixel_bg_colour = d.get("sixel_bg_colour", None)
         lines = [
             f"TYPE   {ct_label}",
             f"MODE   {d['mode']}",
@@ -1623,13 +1625,15 @@ class _CellInspector(tk.Toplevel):
             "",
             f"BITS   {bits:06b}  ({bits})",
             f"SIXEL  {sixel_hex}  '{sixel_chr}'",
+            f"FG     {d['colour']}",
+            f"BG     {sixel_bg_colour if sixel_bg_colour is not None else '—'}",
         ]
         self._info_text.config(state=tk.NORMAL)
         self._info_text.delete("1.0", tk.END)
         self._info_text.insert(tk.END, "\n".join(lines))
         self._info_text.config(state=tk.DISABLED)
 
-        self._draw_sixel_bitmask(d["subcell_fill"], bits)
+        self._draw_sixel_bitmask(d["subcell_fill"], bits, sixel_colours)
 
         self._status_var.set(
             f"R{row:02d} C{col:02d}  {ct_label}  {colour}  "
@@ -1720,6 +1724,23 @@ class _CellInspector(tk.Toplevel):
                         bits |= (1 << bit_idx)
             sixel_code = (0x60 + (bits & 0x1F)) if (bits & 0x20) else (0x20 + (bits & 0x1F))
 
+            # Per-sub-cell colour analysis (fallback path)
+            sixel_colours   = ["NONE"] * (sc * sr)
+            sixel_bg_colour = None
+            if cell_type == CELL_GRAPHICS:
+                try:
+                    from digitiser import _classify_sixel_colours
+                    sixel_colours, sixel_bg_colour = _classify_sixel_colours(
+                        cell_rgb, cell_grey,
+                        bits, colour,
+                        sc, sr,
+                        y0, y1, x0, x1,
+                        sixel_thresh,
+                        self._config,
+                    )
+                except Exception:
+                    pass
+
             ocr_char = " "
             if cell_type == CELL_TEXT:
                 try:
@@ -1758,6 +1779,8 @@ class _CellInspector(tk.Toplevel):
                 "mean_hue": mean_hue, "mean_sat": mean_sat, "mean_val": mean_val,
                 "subcell_fill": subcell_fill, "bits": bits,
                 "sixel_code": sixel_code,
+                "sixel_colours":   sixel_colours,
+                "sixel_bg_colour": sixel_bg_colour,
                 "ocr_char": ocr_char,
                 "cell_mag": cell_mag,
             }
@@ -1818,13 +1841,18 @@ class _CellInspector(tk.Toplevel):
             "",
             f"BITS   {bits:06b}  ({bits})",
             f"SIXEL  {sixel_hex}  '{sixel_chr}'",
+            f"FG     {r['colour']}",
+            f"BG     {r['sixel_bg_colour'] if r.get('sixel_bg_colour') is not None else '—'}",
         ]
         self._info_text.config(state=tk.NORMAL)
         self._info_text.delete("1.0", tk.END)
         self._info_text.insert(tk.END, "\n".join(lines))
         self._info_text.config(state=tk.DISABLED)
 
-        self._draw_sixel_bitmask(r["subcell_fill"], bits)
+        self._draw_sixel_bitmask(
+            r["subcell_fill"], bits,
+            r.get("sixel_colours", ["NONE"] * 6),
+        )
 
         self._status_var.set(
             f"R{r['row']:02d} C{r['col']:02d}  {ct_label}  {colour}  "
@@ -1832,8 +1860,16 @@ class _CellInspector(tk.Toplevel):
             f"spread={r.get('lum_spread', 0):.0f}  lum={r['mean_lum']:.0f}  ink={r['ink_pct']:.1f}%"
         )
 
-    def _draw_sixel_bitmask(self, subcell_fill: list, bits: int):
-        """Draw a 2×3 sixel bitmask diagram with fill-intensity shading."""
+    def _draw_sixel_bitmask(self, subcell_fill: list, bits: int,
+                             sixel_colours: "list[str] | None" = None):
+        """
+        Draw a 2×3 sixel bitmask diagram.
+
+        When ``sixel_colours`` is supplied each sub-cell is filled with its
+        detected teletext colour (set sub-cells) or a dimmed version of the
+        background colour (unset sub-cells).  When absent the old behaviour
+        is used: set=green, unset=dim-green gradient.
+        """
         c = self._sixel_canvas
         c.delete("all")
         cw = 120;  ch = 90
@@ -1851,23 +1887,43 @@ class _CellInspector(tk.Toplevel):
             frac = subcell_fill[bit_idx] if bit_idx < len(subcell_fill) else 0.0
             on   = bool(bits & (1 << bit_idx))
 
-            if on:
-                fill = "#00ff00"
+            if sixel_colours is not None and bit_idx < len(sixel_colours):
+                sc_name = sixel_colours[bit_idx]
+                base_hex = self._COLOUR_HEX.get(sc_name, "#222222")
+                if on:
+                    fill = base_hex
+                else:
+                    # Dim the colour for background/unset sub-cells
+                    try:
+                        r_val = int(base_hex[1:3], 16) // 4
+                        g_val = int(base_hex[3:5], 16) // 4
+                        b_val = int(base_hex[5:7], 16) // 4
+                        fill  = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
+                    except Exception:
+                        fill = "#222222"
             else:
-                # Show fill fraction as dim green gradient
-                g = int(frac * 120)
-                fill = f"#{g:02x}{g:02x}00"
+                # Legacy: no colour data — green for set, dim gradient for unset
+                if on:
+                    fill = "#00ff00"
+                else:
+                    g_val = int(frac * 120)
+                    fill  = f"#{g_val:02x}{g_val:02x}00"
 
             c.create_rectangle(x0, y0, x1, y1, fill=fill, outline="#444444")
 
-            # Show fill percentage inside the cell
-            pct_str = f"{frac*100:.0f}%"
-            text_col = "#000000" if on else "#888888"
+            # Label: colour name abbreviation (top) + fill % (bottom)
+            if sixel_colours is not None and bit_idx < len(sixel_colours):
+                sc_name = sixel_colours[bit_idx]
+                label = sc_name[:3] if sc_name != "NONE" else "—"
+            else:
+                label = f"{frac*100:.0f}%"
+
+            text_col = "#ffffff" if on else "#666666"
             c.create_text(
                 (x0 + x1) // 2, (y0 + y1) // 2,
-                text=pct_str,
-                font=("Courier", 8),
-                fill=text_col
+                text=label,
+                font=("Courier", 7),
+                fill=text_col,
             )
 
         # Bit index labels at edges
