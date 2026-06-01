@@ -249,11 +249,14 @@ def _parse_row(grid: list, row_idx: int, data: str, national_map: dict):
         col += 1
         i   += 1
 
-    # Fill remaining columns with default blank cells
+    # Fill remaining columns with the current row state.
+    # The background colour may have been changed by a NEW_BG preamble earlier
+    # in the row; filling with DEFAULT_BG would show black where the bg colour
+    # should show through.
     while col < 40:
         grid[row_idx][col] = {
-            'char': ' ', 'fg': DEFAULT_FG, 'bg': DEFAULT_BG,
-            'graphics': False, 'separated': False, 'double_height': False
+            'char': ' ', 'fg': fg, 'bg': bg,
+            'graphics': graphics, 'separated': separated, 'double_height': double_h
         }
         col += 1
 

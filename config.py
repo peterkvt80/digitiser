@@ -124,12 +124,13 @@ DIGITISER = {
     # Gate 3 (min-lum): The darkest pixel in the cell must be below
     #         text_min_lum.  Spurious OCR hits on near-white noise cells
     #         never have a genuinely dark pixel; real pencil strokes always do.
-    #         Set to 100 — pencil text on white paper always reaches below 100
-    #         in the darkest part of the stroke; paper grain / compression
-    #         artefacts stay above ~180.
+    #         Set to 100 — pencil text and grey shading (clouds, mountains)
+    #         reach below 100 in the darkest part of the stroke; paper grain
+    #         stays above ~180.  Spurious colour from grey shading is prevented
+    #         by _pick_row_bg requiring 60% coverage, not by this gate.
     "text_spread_threshold": 100,  # min lum spread to even consider a cell as TEXT
     "min_ink_pixels":    20,   # fewer absolute dark pixels than this → EMPTY
-    "noise_spread_limit": 50,  # spread below this → EMPTY (dot-grid noise gate)
+    "noise_spread_limit": 60,  # spread below this → EMPTY (dot-grid noise gate)
     "text_min_lum":     100,   # cell min-luminance must be below this → TEXT
 
     # White graphics detection.
@@ -140,12 +141,13 @@ DIGITISER = {
     #
     # white_gfx_fill_threshold : fraction of cell pixels below sixel_fill_threshold
     #     that must be dark to qualify.  30% separates dense shading from text
-    #     strokes (typically 5-20%) with a comfortable margin.  Increase toward
-    #     0.45 if text cells with heavy strokes are being promoted to white-gfx.
-    # white_gfx_max_saturation : mean HSV saturation of the cell must be below
-    #     this to confirm the ink is achromatic.  40 sits cleanly between
-    #     pencil grey (~15-25) and the dimmest coloured pencil that passes
-    #     _classify_colour (avg_s ~54+).  Do not raise above 50.
+    #     strokes (typically 5-20%).
+    # white_gfx_max_saturation : mean HSV saturation must be below this to
+    #     confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
+    #     the colour classifier requires avg_s >= 50, so 40 sits safely below
+    #     that with a 10-unit gap.
+    # Spurious white_gfx in rows with a non-black preamble background is
+    # prevented by the 60% coverage threshold in _pick_row_bg, not here.
     "white_gfx_fill_threshold": 0.30,
     "white_gfx_max_saturation":   40,
 

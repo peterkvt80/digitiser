@@ -1596,6 +1596,12 @@ class _CellInspector(tk.Toplevel):
         sixel_hex  = f"0x{sixel_code:02X}"
         sixel_chr  = chr(sixel_code) if 0x20 <= sixel_code <= 0x7E else "?"
         bits       = d["bits"]
+        row_bg     = d.get("row_bg")
+
+        # A cell is "bg-inverted" when its colour matches the row background
+        # colour set by the preamble — its sixel bits are inverted in the TTI.
+        is_bg_cell = (row_bg is not None and colour == row_bg
+                      and ct in (CELL_GRAPHICS, CELL_WHITE_GFX))
 
         if ct == CELL_EMPTY:
             tti_char = "' '  (empty)"
@@ -1604,11 +1610,16 @@ class _CellInspector(tk.Toplevel):
         elif ct == CELL_WHITE_GFX:
             tti_char = f"WHITE {sixel_hex} '{sixel_chr}'"
         else:
-            tti_char = f"{sixel_hex} '{sixel_chr}'"
+            inv_note = "  (inv)" if is_bg_cell else ""
+            tti_char = f"{sixel_hex} '{sixel_chr}'{inv_note}"
 
         ct_label = self._CELL_TYPE_LABEL.get(ct, "?")
         sixel_colours   = d.get("sixel_colours",   ["NONE"] * 6)
         sixel_bg_colour = d.get("sixel_bg_colour", None)
+        row_bg_str      = row_bg_name if (row_bg_name := {
+            0x11:"RED",0x12:"GREEN",0x13:"YELLOW",0x14:"BLUE",
+            0x15:"MAGENTA",0x16:"CYAN",0x17:"WHITE",
+        }.get(row_bg)) else "—"
         lines = [
             f"TYPE   {ct_label}",
             f"MODE   {d['mode']}",
@@ -1627,6 +1638,7 @@ class _CellInspector(tk.Toplevel):
             f"SIXEL  {sixel_hex}  '{sixel_chr}'",
             f"FG     {d['colour']}",
             f"BG     {sixel_bg_colour if sixel_bg_colour is not None else '—'}",
+            f"ROW_BG {row_bg_str}",
         ]
         self._info_text.config(state=tk.NORMAL)
         self._info_text.delete("1.0", tk.END)

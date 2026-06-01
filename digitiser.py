@@ -8,14 +8,51 @@ Pipeline
 3. Pre-classify every cell as EMPTY | TEXT | GRAPHICS | WHITE_GFX
    (only TEXT cells run Tesseract — large speed gain)
 4. Per-cell mid-row mode detection (ALPHA ↔ GRAPHICS)
-5. Encode each row: control codes into user-left empty gaps,
-   OCR for text, sixel-sample for graphics/white_gfx
+5. Encode each row with background-colour optimisation and Hold Graphics
 6. Emit OL,0 header + OL,1..24 rows with ESC-encoded control codes
 
 TTI encoding
 ------------
   ESC (0x1B) + (control_code + 0x40)
   Red alpha (0x01) → 0x1B 0x41   Red graphics (0x11) → 0x1B 0x51
+
+Row background optimisation
+---------------------------
+  When a row is predominantly one graphics colour, the encoder sets that
+  colour as the teletext row background using the three-control-code preamble:
+    col 0: ESC <dominant_colour>   — set dominant colour as current FG
+    col 1: ESC ] (0x1D NEW_BG)    — copy current FG → background colour
+    col 2: ESC <first_non-bg_fg>  — switch to the actual foreground colour
+  This costs 3 leading columns but means every subsequent colour-change
+  control slot (which would otherwise display black) shows the background
+  colour instead, eliminating the characteristic black-gap artefact.
+
+  Critically, all sixel characters belonging to the dominant (background)
+  colour are INVERTED before writing.  In the new scheme, cleared bits show
+  the background colour and set bits show the foreground.  A fully-filled
+  block that was CYAN (0x7F, all bits set) becomes 0x20 (all bits clear) so
+  that it renders as CYAN via the background, not as whatever the current
+  foreground colour is.  Partial patterns are inverted bit-for-bit likewise.
+  Mid-row ESC <dominant_colour> control codes are suppressed entirely — those
+  cells show through their inverted (cleared) sixel bits without any code.
+
+Control code placement
+----------------------
+  Colour-change control codes are placed as early as possible: the encoder
+  searches leftward from the transition column for the nearest CELL_EMPTY
+  slot (up to 4 columns back) and places the code there, preserving the
+  sixel data at the transition column itself.  A code is only emitted when
+  the colour or mode actually needs to change — redundant codes (where the
+  state machine already has the correct colour set, or where the target
+  colour equals the row background) are suppressed entirely.
+
+Hold Graphics (0x1E)
+--------------------
+  At each mid-row foreground colour transition, if the slot immediately
+  before the chosen code slot is CELL_EMPTY, ESC ^ (Hold Graphics ON) is
+  placed there.  The teletext hardware then repeats the previous sixel
+  pattern in the code slot instead of showing an empty background square,
+  giving seamless visual continuity across colour boundaries.
 
 Colour rules
 ------------
@@ -797,14 +834,14 @@ def _classify_sixel_colours(
             ]
 
     # ── Step 4: build final per-sub-cell colour list ──────────────────────────
-    # Sub-cells that returned NONE (paper/white, unset) become bg_colour.
-    # If bg_colour is None (single-colour cell) they stay NONE.
+    # Sub-cells that returned NONE are unclassified — they contain paper or ink
+    # too faint to identify.  They are left as NONE rather than being promoted
+    # to bg_colour.  Promoting them was wrong: NONE means "no confident colour
+    # reading", not "matches the secondary colour".  The inspector displays NONE
+    # sub-cells as uncoloured, which is the honest representation.
     sixel_colours: list[str] = []
     for c in raw_colours:
-        if c == "NONE":
-            sixel_colours.append(bg_colour if bg_colour is not None else "NONE")
-        else:
-            sixel_colours.append(c)
+        sixel_colours.append(c)   # NONE stays NONE
 
     log.debug(
         "_classify_sixel_colours: fg=%s bg=%s per_cell=%s",
@@ -1046,7 +1083,7 @@ def _process_grid(warped: np.ndarray, config: dict,
         cell_mode = _assign_cell_modes(cell_type, cell_colour, explicit_mode_at, COLS)
 
         # ── Step 5: encode row ────────────────────────────────────────────────
-        row_str = _encode_row(warped, grey, warped_pil,
+        row_str, row_bg = _encode_row(warped, grey, warped_pil,
                                row, COLS, cw, ch, sc, sr,
                                cell_type, cell_colour, cell_mode,
                                ocr_chars, cell_sixel, config)
@@ -1055,6 +1092,10 @@ def _process_grid(warped: np.ndarray, config: dict,
         # ── Step 6: build per-cell scan_data record ───────────────────────────
         # Collect pixel stats and the exact values used by _encode_row so the
         # Cell Inspector can display what actually went into the TTI.
+        # row_bg is the dominant background colour set by the preamble (or None).
+        # Cells whose colour matches row_bg have their sixels inverted in the TTI
+        # output; the scan_data record reflects that same inverted value so the
+        # inspector always shows what was actually written.
         row_cells = []
         for col in range(COLS):
             x0c = int(col * cw);  x1c = int((col + 1) * cw)
@@ -1086,19 +1127,61 @@ def _process_grid(warped: np.ndarray, config: dict,
                 ink_pixels = ink_pct = mean_hue = mean_sat = mean_val = 0.0
 
             # Sixel bitmask — only meaningful for GRAPHICS cells.
-            # For EMPTY/TEXT cells use the pre-computed value from cell_sixel
-            # (always ' '/0x20 for non-GRAPHICS) so the inspector shows exactly
-            # what went into the TTI with no independent recomputation.
+            # For bg-colour cells, mirror the colour-derived sixel computation
+            # used in _encode_row Pass 2 so the inspector shows exactly what
+            # went into the TTI.
             ct = cell_type[col]
             if ct in (CELL_GRAPHICS, CELL_WHITE_GFX):
-                sixel_char   = cell_sixel[col]
-                sixel_code   = ord(sixel_char)
-                # Reconstruct subcell fill fractions for inspector display only
-                subcell_fill = []
-                bits         = 0
+                raw_sixel = cell_sixel[col]
+                is_bg_cell = (row_bg is not None
+                              and cell_colour[col] == row_bg
+                              and cell_colour[col] not in SUPPRESS_COLOURS)
+
+                if is_bg_cell:
+                    # Recompute sixel from per-sub-cell classification,
+                    # mirroring _encode_row Pass 2 exactly (three-way logic).
+                    sw_sub = (x1c - x0c) / sc
+                    sh_sub = (y1 - y0) / sr
+                    tti_bits = 0
+                    for bit_idx, (sy, sx) in enumerate(
+                        [(r, c) for r in range(sr) for c in range(sc)]
+                    ):
+                        sub_rgb = cell_rgb_np[int(sy*sh_sub):int((sy+1)*sh_sub),
+                                              int(sx*sw_sub):int((sx+1)*sw_sub)]
+                        sub_gry = cell_grey_np[int(sy*sh_sub):int((sy+1)*sh_sub),
+                                               int(sx*sw_sub):int((sx+1)*sw_sub)]
+                        if sub_rgb.size == 0:
+                            continue
+                        sub_colour = _classify_colour(sub_rgb, config)
+                        if sub_colour == row_bg:
+                            pass
+                        elif sub_colour != "NONE":
+                            tti_bits |= (1 << bit_idx)
+                        else:
+                            if sub_gry.size > 0 and float(sub_gry.mean()) < sixel_thresh:
+                                tti_bits |= (1 << bit_idx)
+                    tti_code = (0x60 + (tti_bits & 0x1F)) if (tti_bits & 0x20) else (0x20 + (tti_bits & 0x1F))
+                    sixel_char = chr(tti_code)
+                    sixel_code = tti_code
+                    bits       = tti_bits
+                else:
+                    sixel_char = raw_sixel
+                    sixel_code = ord(sixel_char)
+                    s = sixel_code
+                    if 0x20 <= s <= 0x3F:
+                        bits = s - 0x20
+                    elif 0x60 <= s <= 0x7F:
+                        bits = (s - 0x60) | 0x20
+                    else:
+                        bits = 0
+
+                # Subcell fill fractions from the raw greyscale scan — used
+                # only for the inspector's visual fill display, not for bits.
                 SUBCELL_FILL_FRAC = 0.25
+                raw_bits = 0
                 sw_sub = (x1c - x0c) / sc
                 sh_sub = ch / sr
+                subcell_fill = []
                 for bit_idx, (sy, sx) in enumerate(
                     [(r, c) for r in range(sr) for c in range(sc)]
                 ):
@@ -1108,16 +1191,14 @@ def _process_grid(warped: np.ndarray, config: dict,
                     frac  = float((patch < sixel_thresh).sum()) / max(1, patch.size) if patch.size else 0.0
                     subcell_fill.append(frac)
                     if frac > SUBCELL_FILL_FRAC:
-                        bits |= (1 << bit_idx)
+                        raw_bits |= (1 << bit_idx)
 
-                # ── Per-sub-cell colour analysis ──────────────────────────────
-                # Run _classify_sixel_colours on the full cell RGB patch.
-                # This determines which colour each of the 6 sub-cells contains
-                # and resolves the two-colour palette (fg + bg).
+                # Per-sub-cell colour analysis — always use raw scan bits
+                # so colour classification reflects the physical ink.
                 sixel_colours, sixel_bg_colour = _classify_sixel_colours(
                     cell_rgb_np,
                     cell_grey_np,
-                    bits,
+                    raw_bits,
                     cell_colour[col],
                     sc, sr,
                     y0, y1, x0c, x1c,
@@ -1139,6 +1220,7 @@ def _process_grid(warped: np.ndarray, config: dict,
                 "cell_type":       ct,
                 "colour":          cell_colour[col],
                 "mode":            cell_mode[col],
+                "row_bg":          row_bg,
                 "ocr_char":        ocr if ct == CELL_TEXT else " ",
                 "sixel_char":      sixel_char,
                 "sixel_code":      sixel_code,
@@ -1284,20 +1366,115 @@ def _assign_cell_modes(cell_type, cell_colour, explicit_mode_at, COLS):
 # Row encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _place_code(out_chars: list, col: int, code: str):
+
+_NEW_BG = chr(0x1B) + chr(0x1D + 0x40)   # ESC ] — New Background = current FG
+_HOLD_ON  = chr(0x1B) + chr(0x1E + 0x40)  # ESC ^ — Hold Graphics ON
+_HOLD_OFF = chr(0x1B) + chr(0x1F + 0x40)  # ESC _ — Hold Graphics OFF
+
+
+def _invert_sixel(ch: str) -> str:
     """
-    Place a 2-byte ESC control code in the nearest free slot to the left of
-    col, without overwriting a character already placed there.
-    Falls back to col-1 (overwrite) if no free slot within 3 cells.
+    Invert all 6 sixel bits of a block-graphics character.
+
+    When a row background colour is set via the NEW_BG preamble, cells that
+    carry that same colour as their foreground must have their sixel pattern
+    inverted so that the *set* bits show the foreground (now a different
+    colour) and the *clear* bits show the background (the dominant colour).
+
+    Encoding:
+        0x20-0x3F: bit5 = 0, pattern = byte - 0x20  (bits 0-4)
+        0x60-0x7F: bit5 = 1, pattern = byte - 0x60  (bits 0-4, plus bit5)
+
+    Inversion flips all 6 bits and re-encodes.
     """
-    if col == 0:
-        out_chars[0] = code
-        return
-    for back in range(col - 1, max(col - 4, -1), -1):
-        if out_chars[back] == " ":
-            out_chars[back] = code
-            return
-    out_chars[col - 1] = code
+    code = ord(ch)
+    if 0x20 <= code <= 0x3F:
+        bits = code - 0x20             # bit5 = 0, lower 5 bits
+    elif 0x60 <= code <= 0x7F:
+        bits = (code - 0x60) | 0x20   # bit5 = 1, lower 5 bits
+    else:
+        return ch   # not a sixel character — leave untouched
+    inv = (~bits) & 0x3F
+    if inv & 0x20:
+        return chr(0x60 + (inv & 0x1F))
+    else:
+        return chr(0x20 + (inv & 0x1F))
+
+
+def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
+    """
+    Choose the best background colour to set at the start of a graphics row.
+
+    Returns the colour name to use as the row background (via the
+    FG→NEW_BG preamble), or None if no background optimisation is warranted.
+
+    The optimisation is beneficial only when the dominant colour occupies a
+    wide, largely contiguous band across the row — a "solid colour field" —
+    so that the empty control-code slots between graphics cells naturally
+    show the background colour.  It is harmful when the dominant colour is
+    a shape on a black background, because setting bg=shape_colour would fill
+    every empty cell with that colour instead of black.
+
+    Acceptance criteria (all must pass):
+      1. At least 60 % of all 40 columns carry the dominant colour as
+         CELL_GRAPHICS.  This ensures the colour genuinely covers most of
+         the row, not just a shape floating on black.
+      2. The dominant colour represents ≥ 70 % of all graphics cells in the
+         row (high purity — very few cells of other colours).
+      3. There is at least one other non-dominant-colour graphics cell,
+         otherwise a pure-single-colour row gains nothing from the preamble
+         and the fallback ESC <colour> at col 2 would be redundant anyway.
+    """
+    from collections import Counter
+
+    gfx_colours = [
+        cell_colour[c]
+        for c in range(COLS)
+        if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+        and cell_colour[c] not in SUPPRESS_COLOURS
+    ]
+    if not gfx_colours:
+        return None
+
+    most_common, count = Counter(gfx_colours).most_common(1)[0]
+
+    # Criterion 1: dominant colour must cover ≥ 60 % of all columns
+    if count / COLS < 0.60:
+        return None
+
+    # Criterion 2: dominant colour must be ≥ 60 % of all graphics cells
+    if count / len(gfx_colours) < 0.60:
+        return None
+
+    # Criterion 3: there must be at least one other-colour graphics cell to
+    # make the preamble worthwhile (otherwise col 2 = ESC bg = redundant)
+    if len(gfx_colours) == count:
+        return None
+
+    return most_common
+
+
+def _find_empty_slot(cell_type: list, out_chars: list,
+                     from_col: int, limit: int) -> int:
+    """
+    Search leftward from ``from_col - 1`` for the nearest slot that is both
+    CELL_EMPTY (original classification) AND still holds a plain space in
+    ``out_chars`` (i.e. has not already been filled by the preamble or a
+    previous control code).
+
+    Stopping column is ``limit`` (inclusive).  Returns the slot index, or
+    ``from_col`` as a fallback if no free slot exists (forced overwrite).
+
+    Both conditions are required:
+    - CELL_EMPTY guards against clobbering genuine sixel/OCR content whose
+      out_chars value happens to be 0x20 (the all-bits-clear sixel char).
+    - out_chars[c] == ' ' guards against reusing a slot already claimed by
+      the preamble or an earlier control code in this pass.
+    """
+    for c in range(from_col - 1, limit - 1, -1):
+        if cell_type[c] == CELL_EMPTY and out_chars[c] == " ":
+            return c
+    return from_col   # no free slot found — must overwrite
 
 
 def _encode_row(warped, grey, warped_pil,
@@ -1305,90 +1482,252 @@ def _encode_row(warped, grey, warped_pil,
                 cell_type, cell_colour, cell_mode,
                 ocr_chars: dict, cell_sixel: list, config) -> str:
     """
-    Build a 40-character TTI row string, mirroring the reference analyser.
+    Build a 40-character TTI row string with background-colour optimisation,
+    early colour-code placement, and Hold Graphics at transitions.
 
-    Reference rules (scan_to_tti in the reference main.py):
-      - Each row starts in alpha/WHITE state
-      - For each cell determine target mode (alpha=TEXT, graphics=colour cell)
-        and target colour (WHITE for text, the colour name for graphics)
-      - When mode or colour changes, place the ESC control code in the
-        PREVIOUS column (col-1), or overwrite col 0 if at the start
-      - Cell content: TEXT → OCR char, GRAPHICS → sixel char, EMPTY → space
-      - NONE/BLACK/EMPTY cells are always space; no control codes for them
+    Three-pass approach
+    -------------------
+    Pass 1 — build the raw content array.
+      Each column gets its sixel char, OCR char, or space.  Nothing else.
+
+    Pass 2 — row background preamble (optional).
+      If one graphics colour dominates the row (≥ 40 % of graphics cells),
+      columns 0–2 are reserved for:
+        col 0: ESC <dominant_colour>  — set as current FG
+        col 1: ESC ] (0x1D NEW_BG)   — copy FG → background
+        col 2: ESC <first_fg_colour> — switch to working foreground
+      Every subsequent colour-change control slot then shows the background
+      colour rather than black.  The preamble only occupies columns 0–2 if
+      content starts at column ≥ 3; otherwise it is placed in the first
+      three available positions regardless (detail at cols 0-2 is rare).
+
+    Pass 3 — insert colour-change control codes.
+      For each graphics foreground transition at column C:
+
+      a) EARLY PLACEMENT — search leftward from C-1 for the nearest
+         CELL_EMPTY slot (up to 4 columns back).  Place the colour code
+         there rather than at C.  This preserves the sixel data at C and
+         every other content column: the code only occupies a genuinely
+         empty slot, never overwriting detail.  Only if no empty slot
+         exists within range does the code fall back to C-1 (overwrite).
+
+      b) REDUNDANCY SUPPRESSION — if the state machine already has the
+         correct colour and mode set (e.g. the preamble already set it),
+         no control code is emitted at all.
+
+      c) HOLD GRAPHICS — if we have a held sixel and the slot immediately
+         before the colour-code slot is CELL_EMPTY, place ESC ^ (Hold ON)
+         there so the hardware repeats the previous sixel in the code slot
+         instead of an empty background square.
+
+      Text cells with char_code ≥ 0x40 get an ALPHA WHITE reset placed as
+      early as possible using the same left-search logic.
 
     ocr_chars  : dict  col_index → char  (from _ocr_row_strip)
-    cell_sixel : list  pre-computed sixel char per column (from Step 1);
-                 using this avoids re-calling _decode_sixels with a
-                 potentially different adaptive threshold.
+    cell_sixel : list  pre-computed sixel char per column (from Step 1)
     """
-    y0           = int(row * cell_h)
-    y1           = int(y0 + cell_h)
-
-    # Build the raw character array first (content only, no control codes yet)
+    # ── Pass 1: build raw content array ──────────────────────────────────────
     out_chars = [" "] * COLS
-    for col in range(COLS):
-        ct = cell_type[col]
-        cn = cell_colour[col]
-        mode = cell_mode[col]
-
-        if ct == CELL_EMPTY or cn in SUPPRESS_COLOURS:
-            out_chars[col] = " "
-        elif ct == CELL_TEXT:
-            # Strip OCR covers the whole run; use its result directly.
-            # A space means Tesseract found nothing at this column.
-            ch_str = ocr_chars.get(col, " ") or " "
-            out_chars[col] = ch_str
-        elif ct in (CELL_GRAPHICS, CELL_WHITE_GFX) and mode == "GRAPHICS":
-            # Use the sixel char computed (and validated) during Step 1.
-            # Do NOT call _decode_sixels again — its adaptive threshold can
-            # differ from the Step 1 call and produce a different result.
-            out_chars[col] = cell_sixel[col]
-        else:
-            out_chars[col] = " "
-
-    # ── Insert control codes ─────────────────────────────────────────────────
-    #
-    # Row starts in ALPHA WHITE (teletext default).
-    #
-    # Text character rules:
-    #   0x20-0x3F  blast-through — work in any mode, no control code needed.
-    #   0x40-0x7E  require ALPHA WHITE to be active; emit ESC G if not already.
-    #
-    # Graphics cells always need their colour control code before them.
-    # SUPPRESS_COLOURS (NONE, BLACK) produce no output and need no code.
-    current_mode   = "ALPHA"
-    current_colour = "WHITE"
-
     for col in range(COLS):
         ct   = cell_type[col]
         cn   = cell_colour[col]
         mode = cell_mode[col]
 
-        # TEXT cells: cn="WHITE" but they DO produce output — check type first
+        if ct == CELL_EMPTY or cn in SUPPRESS_COLOURS:
+            out_chars[col] = " "
+        elif ct == CELL_TEXT:
+            out_chars[col] = ocr_chars.get(col, " ") or " "
+        elif ct in (CELL_GRAPHICS, CELL_WHITE_GFX) and mode == "GRAPHICS":
+            out_chars[col] = cell_sixel[col]
+        else:
+            out_chars[col] = " "
+
+    # ── Pass 2: optional row-background preamble ──────────────────────────────
+    row_bg = _pick_row_bg(cell_type, cell_colour, COLS)
+
+    if row_bg is not None:
+        # Determine the first foreground colour needed at col >= 3.
+        # The preamble occupies cols 0-2, so col 2 carries the initial FG
+        # code.  Anchoring first_fg to the first content cell at col >= 3
+        # ensures pass 3 sees the correct colour already set and emits no
+        # redundant or forced code right after the preamble.
+        first_content = next(
+            (c for c in range(3, COLS)
+             if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+             and cell_colour[c] not in SUPPRESS_COLOURS
+             and cell_colour[c] != row_bg),
+            COLS
+        )
+        # Sparse row: fall back to any non-bg content column, then any content
+        if first_content == COLS:
+            first_content = next(
+                (c for c in range(COLS)
+                 if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                 and cell_colour[c] not in SUPPRESS_COLOURS
+                 and cell_colour[c] != row_bg),
+                COLS
+            )
+        if first_content == COLS:
+            first_content = next(
+                (c for c in range(COLS)
+                 if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                 and cell_colour[c] not in SUPPRESS_COLOURS),
+                COLS
+            )
+        first_fg = cell_colour[first_content] if first_content < COLS else row_bg
+
+        out_chars[0] = _esc(GRAPHICS_CODES.get(row_bg,   0x17))
+        out_chars[1] = _NEW_BG
+        out_chars[2] = _esc(GRAPHICS_CODES.get(first_fg, 0x17))
+
+        # Recompute sixel patterns for every cell whose colour matches row_bg.
+        # Once bg = row_bg, sub-cells showing the bg colour must use bit=0
+        # (clear = show background) and sub-cells showing any other colour
+        # must use bit=1 (set = show foreground).
+        #
+        # Decision logic per sub-cell:
+        #   colour == row_bg          → bit=0  (definitely background)
+        #   colour != row_bg, != NONE → bit=1  (clearly a different colour)
+        #   colour == NONE            → use greyscale as tiebreaker:
+        #                               greyscale mean < sixel_thresh → bit=1
+        #                               (ink present but too faint to classify)
+        #
+        # We do NOT fire the greyscale fallback when colour == row_bg, because
+        # the bg-colour pencil itself is dark in greyscale — using greyscale
+        # there would set all bits back to 1, defeating the purpose.
+        sixel_thresh = config.get("sixel_fill_threshold", 175)
+        if warped is not None and grey is not None:
+            for col in range(3, COLS):
+                if not (cell_type[col] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                        and cell_colour[col] == row_bg
+                        and cell_colour[col] not in SUPPRESS_COLOURS):
+                    continue
+                y0_c = int(row * cell_h)
+                y1_c = int(y0_c + cell_h)
+                x0_c = int(col * cw)
+                x1_c = int((col + 1) * cw)
+                cell_rgb = warped[y0_c:y1_c, x0_c:x1_c]
+                cell_gry = grey[y0_c:y1_c, x0_c:x1_c]
+                if cell_rgb.size == 0:
+                    out_chars[col] = _invert_sixel(out_chars[col])
+                    continue
+                sw = cell_rgb.shape[1] / sc
+                sh = cell_rgb.shape[0] / sr
+                bits = 0
+                for bit_idx, (sy, sx) in enumerate(
+                    [(r, c) for r in range(sr) for c in range(sc)]
+                ):
+                    sub_rgb = cell_rgb[int(sy*sh):int((sy+1)*sh),
+                                       int(sx*sw):int((sx+1)*sw)]
+                    sub_gry = cell_gry[int(sy*sh):int((sy+1)*sh),
+                                       int(sx*sw):int((sx+1)*sw)]
+                    if sub_rgb.size == 0:
+                        continue
+                    sub_colour = _classify_colour(sub_rgb, config)
+                    if sub_colour == row_bg:
+                        pass   # definitely background — bit stays 0
+                    elif sub_colour != "NONE":
+                        bits |= (1 << bit_idx)   # clearly a different colour
+                    else:
+                        # Ambiguous — greyscale tiebreaker only when colour
+                        # could not be identified (not when bg colour confirmed)
+                        if sub_gry.size > 0 and float(sub_gry.mean()) < sixel_thresh:
+                            bits |= (1 << bit_idx)
+                code = (0x60 + (bits & 0x1F)) if (bits & 0x20) else (0x20 + (bits & 0x1F))
+                out_chars[col] = chr(code)
+        else:
+            # No image data available (unit-test path) — fall back to simple inversion
+            for col in range(3, COLS):
+                if (cell_type[col] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                        and cell_colour[col] == row_bg
+                        and cell_colour[col] not in SUPPRESS_COLOURS):
+                    out_chars[col] = _invert_sixel(out_chars[col])
+
+        current_mode   = "GRAPHICS"
+        current_colour = first_fg
+        current_bg     = row_bg
+        col_start      = 3
+    else:
+        current_mode   = "ALPHA"
+        current_colour = "WHITE"
+        current_bg     = "BLACK"
+        col_start      = 0
+
+    # ── Pass 3: insert colour-change control codes ────────────────────────────
+    last_gfx_char = " "   # most-recently-seen sixel, for Hold Graphics
+
+    for col in range(col_start, COLS):
+        ct   = cell_type[col]
+        cn   = cell_colour[col]
+        mode = cell_mode[col]
+
+        # ── TEXT cells ────────────────────────────────────────────────────────
         if ct == CELL_TEXT:
-            ch = out_chars[col]
+            ch        = out_chars[col]
             char_code = ord(ch) if (ch and ch != " ") else 0x20
             if char_code >= 0x40:
-                # Proper alpha character — needs ALPHA WHITE mode
+                # Needs ALPHA WHITE mode — place the reset code as early as
+                # possible (leftward search for an empty slot).
                 if current_mode != "ALPHA" or current_colour != "WHITE":
-                    _place_code(out_chars, col, _esc(ALPHA_CODES["WHITE"]))
+                    slot = _find_empty_slot(cell_type, out_chars, col, max(col_start, col - 4))
+                    out_chars[slot] = _esc(ALPHA_CODES["WHITE"])
                     current_mode   = "ALPHA"
                     current_colour = "WHITE"
-            # 0x20-0x3F: blast-through, works in any mode, no code needed
+            # 0x20-0x3F blast-through — no control code needed
             continue
 
-        # Empty or suppressed cells produce nothing
+        # ── Empty / suppressed cells ──────────────────────────────────────────
         if ct == CELL_EMPTY or cn in SUPPRESS_COLOURS:
             continue
 
-        # GRAPHICS or WHITE_GFX cell — emit colour code if state has changed
-        tgt_colour = cn   # "RED", "GREEN", … or "WHITE" for white-gfx
-        if mode != current_mode or tgt_colour != current_colour:
-            _place_code(out_chars, col, _esc(GRAPHICS_CODES.get(tgt_colour, 0x17)))
-            current_mode   = mode
-            current_colour = tgt_colour
+        # ── GRAPHICS / WHITE_GFX cells ────────────────────────────────────────
+        tgt_colour = cn
 
-    return "".join(out_chars)
+        # BG-COLOUR CELLS: when row_bg is active, cells whose colour matches
+        # the background show through the inverted (cleared) sixel bits —
+        # no control code is needed or wanted.  The held sixel is not updated
+        # from these cells (they display as background, not as a distinct glyph).
+        if row_bg is not None and tgt_colour == row_bg:
+            continue
+
+        # REDUNDANCY SUPPRESSION: skip if colour/mode already correct.
+        if mode == current_mode and tgt_colour == current_colour:
+            ch = out_chars[col]
+            if ch != " " and not (len(ch) == 2 and ord(ch[0]) == 0x1B):
+                last_gfx_char = ch
+            continue
+
+        # Colour/mode transition needed.
+        # EARLY PLACEMENT: find the nearest CELL_EMPTY slot to the left.
+        # For the first colour transition in the row (no colour has been placed
+        # yet), search all the way back to col_start so the control code lands
+        # as early as possible — ideally col 0.  For subsequent transitions,
+        # limit the search to 4 columns to avoid displacing earlier content.
+        first_colour = (current_colour == "WHITE" and current_mode == "ALPHA"
+                        and row_bg is None)
+        search_limit = col_start if first_colour else max(col_start, col - 4)
+        slot = _find_empty_slot(cell_type, out_chars, col, search_limit)
+
+        # HOLD GRAPHICS: if we have a held sixel and the slot immediately
+        # before our chosen code slot is CELL_EMPTY, place Hold ON there so
+        # the hardware repeats the previous sixel in the code slot.
+        if (current_mode == "GRAPHICS"
+                and last_gfx_char != " "
+                and slot > col_start
+                and cell_type[slot - 1] == CELL_EMPTY
+                and out_chars[slot - 1] == " "):
+            out_chars[slot - 1] = _HOLD_ON
+
+        out_chars[slot] = _esc(GRAPHICS_CODES.get(tgt_colour, 0x17))
+        current_mode   = mode
+        current_colour = tgt_colour
+
+        # Update held sixel from the content at col (which is now preserved).
+        ch = out_chars[col]
+        if ch != " " and not (len(ch) == 2 and ord(ch[0]) == 0x1B):
+            last_gfx_char = ch
+
+    return "".join(out_chars), row_bg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1630,10 +1969,12 @@ def _classify_colour(cell_rgb: np.ndarray, config: dict) -> str:
     # Reject low-saturation false positives — pencil strokes on dot-grid paper
     # or shadow/noise near a coloured cell can pass the ink pixel count gate
     # but have very low mean saturation. Real colours (even light magenta) have
-    # mean ink-pixel S ≥ 54. False positives from paper texture measure S ≈ 15-25.
-    # Threshold of 40 gives a clear gap on both sides.
+    # mean ink-pixel S ≥ 54. Lighting artefacts and graphite noise measure
+    # S ≈ 15-35.  Threshold of 50 gives a clear gap on both sides and rejects
+    # borderline artefact cells that previously produced spurious red/colour
+    # output in rows that should be empty.
     avg_s = float(np.mean(ink_s))
-    if avg_s < 40:
+    if avg_s < 50:
         log.debug("_classify_colour: NONE (avg_s=%.1f below threshold)", avg_s)
         return "NONE"
 
