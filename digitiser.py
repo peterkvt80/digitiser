@@ -277,147 +277,262 @@ def digitise_full(pil_image: Image.Image, config: dict,
 def _normalise_image(img: np.ndarray,
                      aruco_corners: "np.ndarray | None" = None) -> np.ndarray:
     """
-    Correct for camera colour cast and exposure using the ArUco markers as
-    black/white reference patches.
+    Correct for camera colour cast and spatially-varying exposure using the
+    four ArUco markers as local black/white reference patches.
 
-    The ArUco markers contain known-black pixels (the dark modules) and
-    known-white pixels (the quiet-zone border and white modules).  Sampling
-    these directly from the captured image gives exact per-image black and
-    white reference levels — far more accurate than grey-world or histogram
-    statistics, because the references are right there in the image.
+    Each marker provides a (white_ref, black_ref) luminance pair at its grid
+    corner.  These four anchor points define a bilinear correction surface:
+    for any pixel at normalised grid position (u, v) the local references are
+    interpolated from the four corners, and a per-pixel linear stretch maps
+    that pixel's value to the [0, 255] range.
 
-    If aruco_corners is not provided (e.g. when called before detection),
-    falls back to the grey-world + exposure-stretch approach.
+    This corrects for lighting gradients across the sheet — e.g. a bright
+    lamp on one side that would otherwise make that side's pencil colours
+    appear washed-out and trigger false classifications.
+
+    If aruco_corners is not provided (first-pass call before detection),
+    falls back to grey-world white balance + global 98th-percentile stretch.
 
     Steps
     -----
-    1. Grey-world white balance to remove gross colour cast.
-    2. If ArUco corners supplied: sample the marker quiet zones (white
-       reference) and the marker black modules (black reference) to derive
-       per-channel stretch parameters.
+    1. Grey-world white balance (always) — removes gross colour cast.
+    2. If ArUco corners supplied:
+         a. Sample per-corner (white_ref, black_ref) at each of the four
+            markers using their quiet zones and dark modules.
+         b. Build bilinear correction maps white_map(y,x) and black_map(y,x)
+            by interpolating the four corner references across the full image.
+         c. Apply per-pixel stretch:
+               out = (in - black_map) / (white_map - black_map) * 255
+            clamped to [0, 255].
     3. Otherwise: stretch so the 98th-percentile luminance reaches 240.
     """
     img_f = img.astype(np.float32)
 
     # Step 1: grey-world white balance (always applied)
-    mean_r = float(img_f[:,:,0].mean())
-    mean_g = float(img_f[:,:,1].mean())
-    mean_b = float(img_f[:,:,2].mean())
+    mean_r = float(img_f[:, :, 0].mean())
+    mean_g = float(img_f[:, :, 1].mean())
+    mean_b = float(img_f[:, :, 2].mean())
     overall = (mean_r + mean_g + mean_b) / 3.0
     if overall > 1.0:
-        img_f[:,:,0] = np.clip(img_f[:,:,0] * (overall / mean_r), 0, 255)
-        img_f[:,:,1] = np.clip(img_f[:,:,1] * (overall / mean_g), 0, 255)
-        img_f[:,:,2] = np.clip(img_f[:,:,2] * (overall / mean_b), 0, 255)
+        img_f[:, :, 0] = np.clip(img_f[:, :, 0] * (overall / mean_r), 0, 255)
+        img_f[:, :, 1] = np.clip(img_f[:, :, 1] * (overall / mean_g), 0, 255)
+        img_f[:, :, 2] = np.clip(img_f[:, :, 2] * (overall / mean_b), 0, 255)
 
-    # Step 2: per-image levels from ArUco markers
+    # Step 2: 2D bilinear correction from per-corner ArUco references
     if aruco_corners is not None:
         try:
-            white_ref, black_ref = _sample_marker_levels(img_f, aruco_corners)
-            if white_ref is not None and black_ref is not None:
-                log.debug("ArUco levels: white=%.0f black=%.0f",
-                          white_ref, black_ref)
-                # Linear stretch: map black_ref→0, white_ref→255
-                span = max(white_ref - black_ref, 1.0)
-                img_f = np.clip((img_f - black_ref) * (255.0 / span), 0, 255)
+            corner_levels = _sample_corner_levels(img_f, aruco_corners)
+            if corner_levels is not None:
+                img_f = _apply_bilinear_correction(img_f, aruco_corners,
+                                                   corner_levels)
                 return img_f.astype(np.uint8)
         except Exception as e:
-            log.debug("ArUco level sampling failed: %s", e)
+            log.debug("ArUco 2D correction failed: %s", e)
 
-    # Step 3: fallback — exposure stretch from 98th percentile
-    grey_f = 0.299*img_f[:,:,0] + 0.587*img_f[:,:,1] + 0.114*img_f[:,:,2]
+    # Step 3: fallback — global exposure stretch from 98th percentile
+    grey_f = 0.299*img_f[:, :, 0] + 0.587*img_f[:, :, 1] + 0.114*img_f[:, :, 2]
     p98    = float(np.percentile(grey_f, 98))
     if p98 < 220:
-        scale  = 240.0 / p98
-        img_f  = np.clip(img_f * scale, 0, 255)
+        scale = 240.0 / p98
+        img_f = np.clip(img_f * scale, 0, 255)
         log.debug("Exposure stretch ×%.3f (p98=%.0f)", scale, p98)
 
     return img_f.astype(np.uint8)
 
 
-def _sample_marker_levels(img_f: np.ndarray,
-                           aruco_corners: np.ndarray) -> tuple:
+def _sample_corner_levels(img_f: np.ndarray,
+                           aruco_corners: np.ndarray) -> "np.ndarray | None":
     """
-    Sample the ArUco marker corners to extract black and white reference levels.
+    Sample per-corner (white_ref, black_ref) luminance from the four ArUco
+    markers.
 
-    The detected marker corners define the four vertices of the marker square.
-    Within that square:
-    - The quiet-zone (2-cell border) is printed white → white reference
-    - The centre of the black border frame is printed black → black reference
+    aruco_corners : (4,2) float array, order TL, TR, BR, BL — these are the
+    inward grid corners.  Each marker sits **outside** the grid, so its body
+    extends outward from each grid corner.
 
-    Parameters
-    ----------
-    img_f : float32 RGB array
-    aruco_corners : (4,2) float array — four detected grid corners TL,TR,BR,BL
+    The ArUco marker structure (outward from grid corner):
+      - Immediately adjacent to the grid corner: the marker's black outer border
+      - Further out: the white quiet zone (unprinted paper)
+
+    Sampling positions (both in the outward direction from the grid corner):
+      white_ref : large outward offset — lands in the quiet zone (white paper)
+      black_ref : small outward offset — lands in the black border of the marker
 
     Returns
     -------
-    (white_ref, black_ref) floats, or (None, None) on failure
+    np.ndarray of shape (4, 2) — [[white_TL, black_TL], ...] or None.
     """
-    # We use all four markers.  aruco_corners is the 4 GRID corners (not marker
-    # corners).  We can't directly access marker internals here without re-running
-    # detection.  Use a simpler approach: the grid corners sit exactly at the
-    # inward corners of the markers.  The marker extends msz pixels outward.
-    # Sample a small patch ~1/4 msz outside each grid corner to hit the quiet zone.
-
-    # For simplicity, use the overall image edge regions near the markers.
-    # The top-left and top-right corners of the image (near TL and TR markers)
-    # contain the quiet-zone white.
     H, W = img_f.shape[:2]
 
-    tl = aruco_corners[0]   # grid TL corner pixel
-    tr = aruco_corners[1]   # grid TR corner pixel
-    br = aruco_corners[2]   # grid BR corner pixel
-    bl = aruco_corners[3]   # grid BL corner pixel
+    tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
+                      aruco_corners[2], aruco_corners[3])
 
-    # Estimate marker size from grid width
-    # The marker is MARKER_MM = 16mm.  At this scale, it's about
-    # (grid_width_px / 40) * 2 pixels per mm.  Rough estimate: use 30px.
-    msz_est = max(20, int(abs(tr[0] - tl[0]) / 40))
+    # Estimate marker size from grid width.
+    # The marker is ~16mm wide; the grid is ~40 cells across ~200mm → 5mm/cell.
+    # So marker ≈ 3.2 cells → msz_est ≈ grid_width_px / 12.5.  Use /10 for margin.
+    grid_width_px = max(abs(tr[0] - tl[0]), abs(br[0] - bl[0]), 1.0)
+    msz_est = max(20, int(grid_width_px / 10))
+    patch_r = max(3, min(msz_est // 12, 8))  # small enough to stay within the border/quiet zone
 
-    white_samples = []
-    black_samples = []
+    # Outward offset magnitudes:
+    #   black border is close to the grid corner — use 30% of marker size
+    #   white quiet zone is near the outer edge — use 80% of marker size
+    black_off = max(4, int(msz_est * 0.30))
+    white_off = max(8, int(msz_est * 0.80))
+
+    # Outward direction per corner (sign of dx, sign of dy):
+    # TL corner: outward is up-left  (-,-)
+    # TR corner: outward is up-right (+,-)
+    # BR corner: outward is down-right (+,+)
+    # BL corner: outward is down-left (-,+)
+    signs = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
 
     corners_list = [tl, tr, br, bl]
-    # Outward offsets for each grid corner to hit the marker quiet zone
-    offsets_white = [(-msz_est//2, -msz_est//2),
-                     ( msz_est//2, -msz_est//2),
-                     ( msz_est//2,  msz_est//2),
-                     (-msz_est//2,  msz_est//2)]
-    # Inner offset to hit the black border of the marker
-    offsets_black = [(-msz_est//4, -msz_est//4),
-                     ( msz_est//4, -msz_est//4),
-                     ( msz_est//4,  msz_est//4),
-                     (-msz_est//4,  msz_est//4)]
-
-    patch_r = max(3, msz_est // 6)
+    results = []
 
     for i, (cx, cy) in enumerate(corners_list):
-        for offsets, samples in [(offsets_white, white_samples),
-                                  (offsets_black, black_samples)]:
-            ox, oy = offsets[i]
-            px = int(cx + ox);  py = int(cy + oy)
+        sx, sy = signs[i]
+        readings = {}
+        for key, off in [("black", black_off), ("white", white_off)]:
+            px = int(cx + sx * off)
+            py = int(cy + sy * off)
             x0 = max(0, px - patch_r);  x1 = min(W, px + patch_r)
             y0 = max(0, py - patch_r);  y1 = min(H, py + patch_r)
             patch = img_f[y0:y1, x0:x1]
             if patch.size > 0:
-                lum = float(0.299*patch[:,:,0].mean() +
-                            0.587*patch[:,:,1].mean() +
-                            0.114*patch[:,:,2].mean())
-                samples.append(lum)
+                lum_vals = (0.299 * patch[:, :, 0] +
+                            0.587 * patch[:, :, 1] +
+                            0.114 * patch[:, :, 2]).ravel()
+                # Use 10th percentile for black (darkest pixels in patch),
+                # 90th percentile for white (brightest pixels in patch).
+                # This is robust when the sample window overlaps both ink and paper.
+                if key == "black":
+                    lum = float(np.percentile(lum_vals, 10))
+                else:
+                    lum = float(np.percentile(lum_vals, 90))
+                readings[key] = lum
 
-    if len(white_samples) >= 2 and len(black_samples) >= 2:
-        # Use median to reject outliers
-        white_ref = float(np.median(white_samples))
-        black_ref = float(np.median(black_samples))
-        # Sanity check: white must be significantly brighter than black
-        if white_ref > black_ref + 30:
-            return white_ref, black_ref
+        if "white" in readings and "black" in readings:
+            w, b = readings["white"], readings["black"]
+            if w > b + 20:   # white must be clearly brighter than black
+                results.append((w, b))
+                log.debug("Corner %d: white=%.0f black=%.0f", i, w, b)
+            else:
+                log.debug("Corner %d: sanity failed white=%.0f black=%.0f", i, w, b)
+                results.append(None)
+        else:
+            results.append(None)
 
-    return None, None
+    valid = [r for r in results if r is not None]
+    if len(valid) < 3:
+        log.warning("Only %d/4 ArUco corners yielded valid level readings", len(valid))
+        return None
+
+    # Fill any missing corner with the median of the valid readings
+    med_w = float(np.median([r[0] for r in valid]))
+    med_b = float(np.median([r[1] for r in valid]))
+    filled = [(r if r is not None else (med_w, med_b)) for r in results]
+
+    arr = np.array(filled, dtype=np.float32)   # shape (4, 2)
+    log.debug("Corner levels (white,black): TL=(%.0f,%.0f) TR=(%.0f,%.0f) "
+              "BR=(%.0f,%.0f) BL=(%.0f,%.0f)",
+              arr[0,0], arr[0,1], arr[1,0], arr[1,1],
+              arr[2,0], arr[2,1], arr[3,0], arr[3,1])
+    return arr
+
+
+def _apply_bilinear_correction(img_f: np.ndarray,
+                                aruco_corners: np.ndarray,
+                                corner_levels: np.ndarray) -> np.ndarray:
+    """
+    Apply a spatially-varying linear stretch to img_f using bilinear
+    interpolation of the four corner (white, black) references.
+
+    For each pixel at image coordinates (x, y), the normalised position
+    within the bounding rectangle of the four corners is:
+        u = (x - x_min) / (x_max - x_min)
+        v = (y - y_min) / (y_max - y_min)
+
+    The local references are bilinearly interpolated:
+        white(u,v) = (1-u)(1-v)*W_TL + u(1-v)*W_TR + uv*W_BR + (1-u)v*W_BL
+        black(u,v) = same with B values
+
+    The per-pixel stretch is:
+        out = (in - black(u,v)) / (white(u,v) - black(u,v)) * 255
+
+    corner_levels : (4,2) array — [[W_TL,B_TL],[W_TR,B_TR],[W_BR,B_BR],[W_BL,B_BL]]
+    aruco_corners : (4,2) — TL,TR,BR,BL grid corner pixel coordinates
+    """
+    H, W = img_f.shape[:2]
+
+    tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
+                      aruco_corners[2], aruco_corners[3])
+
+    # Bounding box of the four corners — defines the u,v domain
+    xs = np.array([tl[0], tr[0], br[0], bl[0]])
+    ys = np.array([tl[1], tr[1], br[1], bl[1]])
+    x_min, x_max = float(xs.min()), float(xs.max())
+    y_min, y_max = float(ys.min()), float(ys.max())
+    span_x = max(x_max - x_min, 1.0)
+    span_y = max(y_max - y_min, 1.0)
+
+    W_TL, B_TL = float(corner_levels[0, 0]), float(corner_levels[0, 1])
+    W_TR, B_TR = float(corner_levels[1, 0]), float(corner_levels[1, 1])
+    W_BR, B_BR = float(corner_levels[2, 0]), float(corner_levels[2, 1])
+    W_BL, B_BL = float(corner_levels[3, 0]), float(corner_levels[3, 1])
+
+    # Build u, v coordinate arrays for the full image — shape (H, W)
+    # Clamp to [0,1] so pixels outside the grid bounding box get the nearest
+    # corner's correction rather than an extrapolated value.
+    x_coords = np.arange(W, dtype=np.float32)
+    y_coords = np.arange(H, dtype=np.float32)
+    u = np.clip((x_coords - x_min) / span_x, 0.0, 1.0)   # shape (W,)
+    v = np.clip((y_coords - y_min) / span_y, 0.0, 1.0)    # shape (H,)
+    u2d = u[np.newaxis, :]   # (1, W)
+    v2d = v[:, np.newaxis]   # (H, 1)
+
+    # Bilinear interpolation of white and black reference maps
+    # w00=TL, w10=TR (right), w11=BR, w01=BL (bottom-left)
+    white_map = ((1-u2d)*(1-v2d)*W_TL + u2d*(1-v2d)*W_TR
+               + u2d*v2d*W_BR       + (1-u2d)*v2d*W_BL)  # (H, W)
+    black_map = ((1-u2d)*(1-v2d)*B_TL + u2d*(1-v2d)*B_TR
+               + u2d*v2d*B_BR       + (1-u2d)*v2d*B_BL)  # (H, W)
+
+    span_map = np.maximum(white_map - black_map, 1.0)   # (H, W)
+
+    # Apply per-pixel stretch to each channel — add axis for broadcasting
+    white_map3 = white_map[:, :, np.newaxis]   # (H, W, 1)
+    span_map3  = span_map[:, :, np.newaxis]
+
+    out = np.clip((img_f - white_map3 + span_map3) * (255.0 / span_map3), 0.0, 255.0)
+    # Equivalent to: (img_f - black_map3) / span_map3 * 255, but avoids a
+    # separate black_map3 broadcast:
+    #   (img_f - black) / (white - black) * 255
+    #   = (img_f - (white - span)) / span * 255
+    #   = (img_f - white + span) / span * 255
+    return out.astype(np.float32)
 
 
 # Keep old name as alias
 _white_balance = _normalise_image
+
+
+def _sample_marker_levels(img_f: np.ndarray,
+                           aruco_corners: np.ndarray) -> tuple:
+    """
+    Compatibility wrapper: returns (white_ref, black_ref) medians across all
+    four corners.  Used by calibration.py and any external callers that expect
+    the old single-value interface.  The main digitiser pipeline now uses
+    _sample_corner_levels directly for per-corner 2D correction.
+    """
+    levels = _sample_corner_levels(img_f, aruco_corners)
+    if levels is None:
+        return None, None
+    white_ref = float(np.median(levels[:, 0]))
+    black_ref = float(np.median(levels[:, 1]))
+    if white_ref > black_ref + 30:
+        return white_ref, black_ref
+    return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1408,47 +1523,53 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
     Returns the colour name to use as the row background (via the
     FG→NEW_BG preamble), or None if no background optimisation is warranted.
 
-    The optimisation is beneficial only when the dominant colour occupies a
-    wide, largely contiguous band across the row — a "solid colour field" —
-    so that the empty control-code slots between graphics cells naturally
-    show the background colour.  It is harmful when the dominant colour is
-    a shape on a black background, because setting bg=shape_colour would fill
-    every empty cell with that colour instead of black.
+    WHITE is never selected as the background colour — it is always a
+    foreground element (clouds, highlights).  WHITE_GFX cells are excluded
+    from the dominant-colour count so that cloud cells in a predominantly
+    CYAN sky row do not displace CYAN as the dominant colour.
 
     Acceptance criteria (all must pass):
       1. At least 60 % of all 40 columns carry the dominant colour as
-         CELL_GRAPHICS.  This ensures the colour genuinely covers most of
-         the row, not just a shape floating on black.
-      2. The dominant colour represents ≥ 70 % of all graphics cells in the
-         row (high purity — very few cells of other colours).
-      3. There is at least one other non-dominant-colour graphics cell,
-         otherwise a pure-single-colour row gains nothing from the preamble
-         and the fallback ESC <colour> at col 2 would be redundant anyway.
+         CELL_GRAPHICS (not WHITE_GFX).
+      2. The dominant colour represents ≥ 60 % of all non-WHITE graphics cells.
+      3. There is at least one other graphics cell (including WHITE_GFX),
+         otherwise the preamble gains nothing.
     """
     from collections import Counter
 
+    # Only count non-WHITE CELL_GRAPHICS for dominant colour selection.
+    # WHITE_GFX cells are always foreground — never background.
     gfx_colours = [
         cell_colour[c]
         for c in range(COLS)
-        if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+        if cell_type[c] == CELL_GRAPHICS
         and cell_colour[c] not in SUPPRESS_COLOURS
+        and cell_colour[c] != "WHITE"
     ]
     if not gfx_colours:
         return None
 
     most_common, count = Counter(gfx_colours).most_common(1)[0]
 
+    # Safety: never set WHITE as background
+    if most_common == "WHITE":
+        return None
+
     # Criterion 1: dominant colour must cover ≥ 60 % of all columns
     if count / COLS < 0.60:
         return None
 
-    # Criterion 2: dominant colour must be ≥ 60 % of all graphics cells
+    # Criterion 2: dominant colour must be ≥ 60 % of non-WHITE graphics cells
     if count / len(gfx_colours) < 0.60:
         return None
 
-    # Criterion 3: there must be at least one other-colour graphics cell to
-    # make the preamble worthwhile (otherwise col 2 = ESC bg = redundant)
-    if len(gfx_colours) == count:
+    # Criterion 3: at least one other graphics cell (including WHITE_GFX)
+    total_gfx = sum(
+        1 for c in range(COLS)
+        if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+        and cell_colour[c] not in SUPPRESS_COLOURS
+    )
+    if total_gfx == count:
         return None
 
     return most_common
@@ -1666,13 +1787,19 @@ def _encode_row(warped, grey, warped_pil,
             ch        = out_chars[col]
             char_code = ord(ch) if (ch and ch != " ") else 0x20
             if char_code >= 0x40:
-                # Needs ALPHA WHITE mode — place the reset code as early as
-                # possible (leftward search for an empty slot).
-                if current_mode != "ALPHA" or current_colour != "WHITE":
-                    slot = _find_empty_slot(cell_type, out_chars, col, max(col_start, col - 4))
-                    out_chars[slot] = _esc(ALPHA_CODES["WHITE"])
-                    current_mode   = "ALPHA"
-                    current_colour = "WHITE"
+                # Needs ALPHA WHITE mode.  Only insert the reset when we are
+                # already in alpha context (no graphics preamble active and no
+                # graphics cells have been seen yet on this row).  Inserting
+                # ESC_ALPHA_WHITE mid-graphics would break the sixel state.
+                if row_bg is None and current_mode != "GRAPHICS":
+                    if current_mode != "ALPHA" or current_colour != "WHITE":
+                        slot = _find_empty_slot(cell_type, out_chars, col, max(col_start, col - 4))
+                        out_chars[slot] = _esc(ALPHA_CODES["WHITE"])
+                        current_mode   = "ALPHA"
+                        current_colour = "WHITE"
+                else:
+                    # In graphics context — treat as space to avoid breaking state
+                    out_chars[col] = " "
             # 0x20-0x3F blast-through — no control code needed
             continue
 
@@ -1701,12 +1828,22 @@ def _encode_row(warped, grey, warped_pil,
         # EARLY PLACEMENT: find the nearest CELL_EMPTY slot to the left.
         # For the first colour transition in the row (no colour has been placed
         # yet), search all the way back to col_start so the control code lands
-        # as early as possible — ideally col 0.  For subsequent transitions,
-        # limit the search to 4 columns to avoid displacing earlier content.
+        # as early as possible — ideally col 0.  If no CELL_EMPTY slot exists
+        # between col_start and the content (e.g. all cols 0..col-1 are
+        # CELL_GRAPHICS), force placement at col_start regardless, because
+        # placing the colour code early is more important than preserving
+        # the content at that specific cell (the colour code must appear before
+        # any graphics content to set the state correctly).
+        # For subsequent transitions, limit the search to 4 columns.
         first_colour = (current_colour == "WHITE" and current_mode == "ALPHA"
                         and row_bg is None)
-        search_limit = col_start if first_colour else max(col_start, col - 4)
-        slot = _find_empty_slot(cell_type, out_chars, col, search_limit)
+        if first_colour:
+            slot = _find_empty_slot(cell_type, out_chars, col, col_start)
+            if slot == col:
+                slot = col_start   # force to first column if no empty slot found
+        else:
+            search_limit = max(col_start, col - 4)
+            slot = _find_empty_slot(cell_type, out_chars, col, search_limit)
 
         # HOLD GRAPHICS: if we have a held sixel and the slot immediately
         # before our chosen code slot is CELL_EMPTY, place Hold ON there so
