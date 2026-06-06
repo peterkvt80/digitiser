@@ -552,9 +552,11 @@ class TeletextRenderer:
             # ──────────────────────────────────────────────────────────────────
 
             if cell['graphics']:
-                if self._font2_path and self._fonts_confirmed:
+                import sys
+                # Bypass font rendering for graphics on Windows to avoid Wingdings bug
+                if self._font2_path and self._fonts_confirmed and not sys.platform.startswith("win"):
                     self._canvas.create_text(
-                        xc, yc, text=display_ch, font=font,
+                        xc, yc, text=ch, font=font,
                         fill=fg_hex, anchor=tk.CENTER,
                     )
                 else:
@@ -566,9 +568,8 @@ class TeletextRenderer:
                     fill=fg_hex, anchor=tk.CENTER,
                 )
 
-
     def _draw_gfx_bitmask(self, ch: str, x0: int, y0: int, x1: int, y1: int,
-                           colour: str, separated: bool):
+                          colour: str, separated: bool):
         """
         Fallback renderer: draw 2×3 sixel bitmask rectangles.
 
@@ -600,17 +601,21 @@ class TeletextRenderer:
 
         cw = x1 - x0
         ch_h = y1 - y0
-        pw = cw // 2
-        ph = ch_h // 3
-        gap = 1 if separated else 0
 
         for bit_idx, (cx, cy) in enumerate(
-            [(0,0),(1,0),(0,1),(1,1),(0,2),(1,2)]
+                [(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]
         ):
             if bits & (1 << bit_idx):
-                rx = x0 + cx * pw + gap
-                ry = y0 + cy * ph + gap
+                # Dynamically calculate starts and ends to handle fractional rounding gaps
+                rx0 = x0 + (cx * cw) // 2
+                ry0 = y0 + (cy * ch_h) // 3
+
+                # The next block's start is exactly this block's seamless end point
+                rx1 = x0 + ((cx + 1) * cw) // 2
+                ry1 = y0 + ((cy + 1) * ch_h) // 3
+
                 self._canvas.create_rectangle(
-                    rx, ry, rx + pw - gap, ry + ph - gap,
+                    rx0, ry0, rx1, ry1,
                     fill=colour, outline=""
                 )
+
