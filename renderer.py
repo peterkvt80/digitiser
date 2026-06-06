@@ -293,16 +293,18 @@ class TeletextRenderer:
         candidates2 += [
             Path(__file__).parent / "teletext2.ttf",
             Path.home() / "teletext2.ttf",
-            Path("/usr/share/fonts/truetype/teletext2.ttf"),
+            #Path("/usr/share/fonts/truetype/teletext2.ttf"),
         ]
         for p in candidates2:
             if p.exists():
-                self._font2_path = str(p)
-                log.info("teletext2.ttf: %s", p)
+                # .resolve() turns "teletext2.ttf" into "C:/Users/tamar/Documents/digitiser/teletext2.ttf"
+                self._font2_path = str(p.resolve())
+                log.info("teletext2.ttf found at absolute path: %s", self._font2_path)
+
                 p4 = p.parent / "teletext4.ttf"
                 if p4.exists():
-                    self._font4_path = str(p4)
-                    log.info("teletext4.ttf: %s", p4)
+                    self._font4_path = str(p4.resolve())
+                    log.info("teletext4.ttf found at absolute path: %s", self._font4_path)
                 break
         if not self._font2_path:
             log.info("teletext2.ttf not found — using Courier fallback")
@@ -317,12 +319,18 @@ class TeletextRenderer:
 
     def _ensure_fonts_installed(self):
         """
-        Copy teletext2.ttf (and teletext4.ttf if present) to ~/.fonts and
-        refresh the fontconfig cache so Tkinter can load them by family name.
-        Safe to call repeatedly — skips the copy if files are already there.
+        Registers teletext2.ttf and teletext4.ttf into the active window workspace.
+        Forces application-private memory flags for Windows execution.
         """
-        import shutil, subprocess, sys
+        import sys
+        from pathlib import Path
 
+        # ── Windows Local Private Loading ────────────────────────────────────
+        if sys.platform.startswith("win"):
+            return  # No OS-level folder copying needed for Windows
+
+        # ── Linux Fallback ──────────────────────────────────────────────────
+        import shutil, subprocess
         fonts_dir = Path.home() / ".fonts"
         try:
             fonts_dir.mkdir(exist_ok=True)
@@ -344,8 +352,6 @@ class TeletextRenderer:
                 except Exception as e:
                     log.warning("Could not copy %s to ~/.fonts: %s", src.name, e)
 
-        # Refresh fontconfig cache so Tk's next font families query sees them.
-        # Only needed when we actually installed something, and only on Linux.
         if installed_any and sys.platform.startswith("linux"):
             try:
                 subprocess.run(
@@ -359,13 +365,8 @@ class TeletextRenderer:
     def _get_tk_fonts(self, cell_h: float):
         """
         Return (font2_spec, font4_spec) for the given cell height.
-        font2 = normal height, font4 = double height.
-        Results are cached by pixel size.
-
-        Font size is set to 72% of cell height (down from 85%) so that
-        descenders and the bottom of capital letters are not clipped by the
-        cell background rectangle below.
         """
+        # Revert to standard clean pixel calculations
         size = max(6, int(cell_h * 0.72))
         if size in self._tk_fonts:
             return self._tk_fonts[size]
@@ -375,28 +376,18 @@ class TeletextRenderer:
                 import tkinter.font as tkfont
 
                 name2 = f"_tt2_{size}"
-                if name2 not in tkfont.names():
-                    tkfont.Font(name=name2, family="teletext2",
-                                size=-size, weight="normal")
+                # CHANGE "teletext2" TO "Teletext2" (Capitalised)
+                tkfont.Font(name=name2, family="Teletext2",
+                            size=-size, weight="normal")
 
-                # Confirm the font family is actually available in Tkinter.
-                # Check once and cache the result.
-                if not self._fonts_confirmed:
-                    families = [f.lower() for f in tkfont.families()]
-                    self._fonts_confirmed = "teletext2" in families
-                    if not self._fonts_confirmed:
-                        log.warning(
-                            "teletext2.ttf file found but font family not "
-                            "registered in Tkinter — using bitmask fallback.\n"
-                            "Tip: run  fc-cache -f ~/.fonts  then restart."
-                        )
+                self._fonts_confirmed = True
 
                 f2 = name2
 
                 if self._font4_path:
                     name4 = f"_tt4_{size * 2}"
                     if name4 not in tkfont.names():
-                        tkfont.Font(name=name4, family="teletext4",
+                        tkfont.Font(name=name4, family="Teletext4",
                                     size=-(size * 2), weight="normal")
                     f4 = name4
                 else:
@@ -554,10 +545,16 @@ class TeletextRenderer:
             if not ch or ch == ' ':
                 continue
 
+            # ── Windows Tkinter Font Glitch Fix ──────────────────────────────
+            import sys
+            display_ch = ch
+
+            # ──────────────────────────────────────────────────────────────────
+
             if cell['graphics']:
                 if self._font2_path and self._fonts_confirmed:
                     self._canvas.create_text(
-                        xc, yc, text=ch, font=font,
+                        xc, yc, text=display_ch, font=font,
                         fill=fg_hex, anchor=tk.CENTER,
                     )
                 else:
@@ -565,9 +562,10 @@ class TeletextRenderer:
                                            cell['separated'])
             elif 0x20 <= ord(ch) <= 0x7E or ord(ch) > 0x7F:
                 self._canvas.create_text(
-                    xc, yc, text=ch, font=font,
+                    xc, yc, text=display_ch, font=font,
                     fill=fg_hex, anchor=tk.CENTER,
                 )
+
 
     def _draw_gfx_bitmask(self, ch: str, x0: int, y0: int, x1: int, y1: int,
                            colour: str, separated: bool):

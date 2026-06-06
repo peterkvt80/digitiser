@@ -14,7 +14,11 @@ Dependencies (install on Pi):
 import argparse
 import logging
 import sys
+import io
 from pathlib import Path
+
+# Force the Windows terminal to interpret text as UTF-8 (like Linux does)
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
