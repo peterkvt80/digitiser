@@ -339,107 +339,57 @@ def _normalise_image(img: np.ndarray,
 
     return img_f.astype(np.uint8)
 
-
-def _sample_corner_levels(img_f: np.ndarray,
-                           aruco_corners: np.ndarray) -> "np.ndarray | None":
+def _sample_corner_levels(self, img_f, corners):
     """
-    Sample per-corner (white_ref, black_ref) luminance from the four ArUco
-    markers.
-
-    aruco_corners : (4,2) float array, order TL, TR, BR, BL — these are the
-    inward grid corners.  Each marker sits **outside** the grid, so its body
-    extends outward from each grid corner.
-
-    The ArUco marker structure (outward from grid corner):
-      - Immediately adjacent to the grid corner: the marker's black outer border
-      - Further out: the white quiet zone (unprinted paper)
-
-    Sampling positions (both in the outward direction from the grid corner):
-      white_ref : large outward offset — lands in the quiet zone (white paper)
-      black_ref : small outward offset — lands in the black border of the marker
-
-    Returns
-    -------
-    np.ndarray of shape (4, 2) — [[white_TL, black_TL], ...] or None.
+    Samples reliable local black and white levels right at the
+    ArUco corner grid boundaries. Logs tracking updates for debugging.
     """
+
     H, W = img_f.shape[:2]
+    tl, tr, br, bl = corners
 
-    tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
-                      aruco_corners[2], aruco_corners[3])
-
-    # Estimate marker size from grid width.
-    # The marker is ~16mm wide; the grid is ~40 cells across ~200mm → 5mm/cell.
-    # So marker ≈ 3.2 cells → msz_est ≈ grid_width_px / 12.5.  Use /10 for margin.
-    grid_width_px = max(abs(tr[0] - tl[0]), abs(br[0] - bl[0]), 1.0)
-    msz_est = max(20, int(grid_width_px / 10))
-    patch_r = max(3, min(msz_est // 12, 8))  # small enough to stay within the border/quiet zone
-
-    # Outward offset magnitudes:
-    #   black border is close to the grid corner — use 30% of marker size
-    #   white quiet zone is near the outer edge — use 80% of marker size
-    black_off = max(4, int(msz_est * 0.30))
-    white_off = max(8, int(msz_est * 0.80))
-
-    # Outward direction per corner (sign of dx, sign of dy):
-    # TL corner: outward is up-left  (-,-)
-    # TR corner: outward is up-right (+,-)
-    # BR corner: outward is down-right (+,+)
-    # BL corner: outward is down-left (-,+)
-    signs = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-
+    # Inward-pointing directional signs to move toward the text area
+    signs = [(1, 1), (-1, 1), (-1, -1), (1, -1)]
+    corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
     corners_list = [tl, tr, br, bl]
     results = []
 
     for i, (cx, cy) in enumerate(corners_list):
         sx, sy = signs[i]
+        c_name = corner_names[i]
         readings = {}
-        for key, off in [("black", black_off), ("white", white_off)]:
+
+        # Black: 2 pixels inward (black ink) | White: 25 pixels inward (white paper)
+        for key, off in [("black", 2), ("white", 25)]:
             px = int(cx + sx * off)
             py = int(cy + sy * off)
-            x0 = max(0, px - patch_r);  x1 = min(W, px + patch_r)
-            y0 = max(0, py - patch_r);  y1 = min(H, py + patch_r)
+
+            r = 2
+            x0 = max(0, px - r);
+            x1 = min(W, px + r)
+            y0 = max(0, py - r);
+            y1 = min(H, py + r)
+
             patch = img_f[y0:y1, x0:x1]
             if patch.size > 0:
-                lum_vals = (0.299 * patch[:, :, 0] +
-                            0.587 * patch[:, :, 1] +
-                            0.114 * patch[:, :, 2]).ravel()
-                # Use 10th percentile for black (darkest pixels in patch),
-                # 90th percentile for white (brightest pixels in patch).
-                # This is robust when the sample window overlaps both ink and paper.
-                if key == "black":
-                    lum = float(np.percentile(lum_vals, 10))
-                else:
-                    lum = float(np.percentile(lum_vals, 90))
-                readings[key] = lum
+                readings[key] = float(np.mean(patch))
 
-        if "white" in readings and "black" in readings:
-            w, b = readings["white"], readings["black"]
-            if w > b + 20:   # white must be clearly brighter than black
-                results.append((w, b))
-                log.debug("Corner %d: white=%.0f black=%.0f", i, w, b)
+        # Sanity check: Ensure white paper is brighter than black ink
+        if "black" in readings and "white" in readings:
+            b = readings["black"]
+            w = readings["white"]
+            if w > b + 20:
+                results.append((b, w))
+                log.warning(f"ArUco {c_name} levels read successfully: Black={b:.1f}, White={w:.1f}")
+                print(f"ArUco {c_name} levels read successfully: Black={b:.1f}, White={w:.1f}")
             else:
-                log.debug("Corner %d: sanity failed white=%.0f black=%.0f", i, w, b)
-                results.append(None)
+                log.warning(
+                    f"ArUco {c_name} failed sanity check (White={w:.1f} not significantly brighter than Black={b:.1f})")
         else:
-            results.append(None)
+            log.warning(f"ArUco {c_name} missed target sampling pixels entirely.")
 
-    valid = [r for r in results if r is not None]
-    if len(valid) < 3:
-        log.warning("Only %d/4 ArUco corners yielded valid level readings", len(valid))
-        return None
-
-    # Fill any missing corner with the median of the valid readings
-    med_w = float(np.median([r[0] for r in valid]))
-    med_b = float(np.median([r[1] for r in valid]))
-    filled = [(r if r is not None else (med_w, med_b)) for r in results]
-
-    arr = np.array(filled, dtype=np.float32)   # shape (4, 2)
-    log.debug("Corner levels (white,black): TL=(%.0f,%.0f) TR=(%.0f,%.0f) "
-              "BR=(%.0f,%.0f) BL=(%.0f,%.0f)",
-              arr[0,0], arr[0,1], arr[1,0], arr[1,1],
-              arr[2,0], arr[2,1], arr[3,0], arr[3,1])
-    return arr
-
+    log.warning(f"Successfully processed {len(results)}/4 ArUco corners for exposure correction calibration.")
+    return results
 
 def _apply_bilinear_correction(img_f: np.ndarray,
                                 aruco_corners: np.ndarray,
@@ -2484,10 +2434,25 @@ def get_warped_image(pil_image: Image.Image, config: dict):
     if not _CV2:
         return None
     try:
-        img_np  = _normalise_image(np.array(pil_image.convert("RGB")))
-        corners = _find_grid_corners_via_aruco(img_np, config)
-        warped  = _perspective_warp(img_np, corners,
-                                    config["warp_width"], config["warp_height"])
+        # 1. Convert to raw NumPy array first
+        raw_img_np = np.array(pil_image.convert("RGB"))
+
+        # 2. Locate the ArUco corners safely from the raw frame
+        corners = _find_grid_corners_via_aruco(raw_img_np, config)
+
+        # 3. Save corners inside config so _normalise_image can access them
+        config["aruco_corners"] = corners
+
+        # Also bind to a global fallback variable in case the function looks there
+        global global_aruco_corners
+        global_aruco_corners = corners
+
+        # 4. Run the normalization now that the data is primed
+        img_np = _normalise_image(raw_img_np)
+
+        # 5. Perform the final geometric warp
+        warped = _perspective_warp(img_np, corners,
+                                   config["warp_width"], config["warp_height"])
         return Image.fromarray(warped)
     except Exception as e:
         log.error("get_warped_image: %s", e)
