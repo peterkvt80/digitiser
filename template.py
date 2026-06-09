@@ -45,6 +45,7 @@ CALIB_COLOUR_MAP = {
 
 # ── Text content ──────────────────────────────────────────────────────────────
 TITLE_TEXT = "MAKE YOUR OWN TELETEXT PAGE"
+SUBTITLE_TEXT = "www.xenoxxx.com/block26/index.html#competition"
 INSTRUCTIONS = [
     "• Draw with red, green, yellow, dark blue, light blue or purple pencils. For white, shade with a black pencil. Any rectangle left blank is black.",
     "• Write 1 letter per rectangle with a black pencil.",
@@ -237,11 +238,13 @@ def generate_template(output_dir=None, show=False) -> dict:
 
     # ── Text rendering ────────────────────────────────────────────────────────
     TITLE_SIZE_PT = 18
+    SUBTITLE_SIZE_PT = 9
     INSTR_SIZE_PT = 11
     CAPTION_SIZE_PT = 9
     FIELD_LABEL_SIZE_PT = 8
 
     title_f   = get_font(TELETEXT_FONT, TITLE_SIZE_PT)
+    subtitle_f   = get_font(TELETEXT_FONT, SUBTITLE_SIZE_PT)
     instr_f   = get_font(TELETEXT_FONT, INSTR_SIZE_PT)
     caption_f = get_font(TELETEXT_FONT, CAPTION_SIZE_PT)
     field_f   = get_font(TELETEXT_FONT, FIELD_LABEL_SIZE_PT)
@@ -254,6 +257,9 @@ def generate_template(output_dir=None, show=False) -> dict:
         tx = grid_x0 + (grid_x1 - grid_x0 - (t_bbox[2] - t_bbox[0])) // 2
         draw.text((tx, ty), line, fill=(0, 0, 0), font=title_f)
         ty += pt_to_px(TITLE_SIZE_PT) * 1.2
+
+    # Subtitle
+    draw.text((tx, ty), SUBTITLE_TEXT, fill=(0, 0, 0), font=subtitle_f)
 
     # Instructions
     tm   = mm_to_px(PANEL_MARGIN_MM)
