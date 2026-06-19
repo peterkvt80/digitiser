@@ -339,57 +339,125 @@ def _normalise_image(img: np.ndarray,
 
     return img_f.astype(np.uint8)
 
-def _sample_corner_levels(self, img_f, corners):
-    """
-    Samples reliable local black and white levels right at the
-    ArUco corner grid boundaries. Logs tracking updates for debugging.
-    """
 
+def _sample_corner_levels(img_f: np.ndarray,
+                           aruco_corners: np.ndarray) -> "np.ndarray | None":
+    """
+    Sample per-corner (white_ref, black_ref) luminance from the four ArUco
+    markers.
+
+    aruco_corners : (4,2) float array, order TL, TR, BR, BL — these are the
+    inward grid corners.  Each marker sits **outside** the grid, so its body
+    extends outward from each grid corner.
+
+    The ArUco marker structure (outward from grid corner):
+      - Immediately adjacent to the grid corner: the marker's black outer border
+      - Further out: the white quiet zone (unprinted paper)
+
+    Sampling positions (both in the outward direction from the grid corner):
+      white_ref : large outward offset — lands in the quiet zone (white paper)
+      black_ref : small outward offset — lands in the black border of the marker
+
+    Returns
+    -------
+    np.ndarray of shape (4, 2) — [[white_TL, black_TL], ...] or None.
+    """
     H, W = img_f.shape[:2]
-    tl, tr, br, bl = corners
 
-    # Inward-pointing directional signs to move toward the text area
-    signs = [(1, 1), (-1, 1), (-1, -1), (1, -1)]
-    corner_names = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
+    tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
+                      aruco_corners[2], aruco_corners[3])
+
+    # Estimate marker size from grid width.
+    # The marker is ~16mm wide; the grid is ~40 cells across ~200mm → 5mm/cell.
+    # So marker ≈ 3.2 cells → msz_est ≈ grid_width_px / 12.5.  Use /10 for margin.
+    grid_width_px = max(abs(tr[0] - tl[0]), abs(br[0] - bl[0]), 1.0)
+    msz_est = max(20, int(grid_width_px / 10))
+    patch_r = max(3, min(msz_est // 12, 8))  # small enough to stay within the border/quiet zone
+
+    # Outward offset magnitudes:
+    #   black border is close to the grid corner — use 30% of marker size.
+    #     At 30% of msz_est we are safely inside the marker body.
+    #   white quiet zone is JUST PAST the outer edge of the marker — use
+    #     120% of marker size.  The outer edge of the marker is at ~100% of
+    #     msz_est outward from the grid corner, so 120% lands in the quiet
+    #     zone (a few mm of unprinted paper).
+    #     Previous value was 80%, which sampled INSIDE the marker body and
+    #     always returned a dark reading → all corners failed the sanity check.
+    black_off = max(4, int(msz_est * 0.30))
+    white_off = max(8, int(msz_est * 1.20))
+
+    # Outward direction per corner (sign of dx, sign of dy):
+    # TL corner: outward is up-left  (-,-)
+    # TR corner: outward is up-right (+,-)
+    # BR corner: outward is down-right (+,+)
+    # BL corner: outward is down-left (-,+)
+    signs = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+
     corners_list = [tl, tr, br, bl]
     results = []
 
     for i, (cx, cy) in enumerate(corners_list):
         sx, sy = signs[i]
-        c_name = corner_names[i]
         readings = {}
-
-        # Black: 2 pixels inward (black ink) | White: 25 pixels inward (white paper)
-        for key, off in [("black", 2), ("white", 25)]:
+        for key, off in [("black", black_off), ("white", white_off)]:
             px = int(cx + sx * off)
             py = int(cy + sy * off)
 
-            r = 2
-            x0 = max(0, px - r);
-            x1 = min(W, px + r)
-            y0 = max(0, py - r);
-            y1 = min(H, py + r)
+            # Bounds check: if the sample centre is outside the image, skip it.
+            # Without this, negative px/py values are clamped by max(0,...) on
+            # one end but min(W,...) returns a negative on the other, causing
+            # numpy to interpret the slice as a reverse-index (wrapping to the
+            # far end of the image) — producing completely wrong luminance
+            # readings.  A skipped reading is handled below as a missing key.
+            if not (patch_r <= px < W - patch_r and patch_r <= py < H - patch_r):
+                log.debug("Corner %d '%s': center (%d,%d) outside image "
+                          "[%dx%d] — skipped", i, key, px, py, W, H)
+                continue
 
+            x0 = max(0, px - patch_r);  x1 = min(W, px + patch_r)
+            y0 = max(0, py - patch_r);  y1 = min(H, py + patch_r)
             patch = img_f[y0:y1, x0:x1]
             if patch.size > 0:
-                readings[key] = float(np.mean(patch))
+                lum_vals = (0.299 * patch[:, :, 0] +
+                            0.587 * patch[:, :, 1] +
+                            0.114 * patch[:, :, 2]).ravel()
+                # Use 10th percentile for black (darkest pixels in patch),
+                # 90th percentile for white (brightest pixels in patch).
+                # This is robust when the sample window overlaps both ink and paper.
+                if key == "black":
+                    lum = float(np.percentile(lum_vals, 10))
+                else:
+                    lum = float(np.percentile(lum_vals, 90))
+                readings[key] = lum
 
-        # Sanity check: Ensure white paper is brighter than black ink
-        if "black" in readings and "white" in readings:
-            b = readings["black"]
-            w = readings["white"]
-            if w > b + 20:
-                results.append((b, w))
-                log.warning(f"ArUco {c_name} levels read successfully: Black={b:.1f}, White={w:.1f}")
-                print(f"ArUco {c_name} levels read successfully: Black={b:.1f}, White={w:.1f}")
+        if "white" in readings and "black" in readings:
+            w, b = readings["white"], readings["black"]
+            if w > b + 20:   # white must be clearly brighter than black
+                results.append((w, b))
+                log.debug("Corner %d: white=%.0f black=%.0f", i, w, b)
             else:
-                log.warning(
-                    f"ArUco {c_name} failed sanity check (White={w:.1f} not significantly brighter than Black={b:.1f})")
+                log.debug("Corner %d: sanity failed white=%.0f black=%.0f", i, w, b)
+                results.append(None)
         else:
-            log.warning(f"ArUco {c_name} missed target sampling pixels entirely.")
+            results.append(None)
 
-    log.warning(f"Successfully processed {len(results)}/4 ArUco corners for exposure correction calibration.")
-    return results
+    valid = [r for r in results if r is not None]
+    if len(valid) < 3:
+        log.warning("Only %d/4 ArUco corners yielded valid level readings", len(valid))
+        return None
+
+    # Fill any missing corner with the median of the valid readings
+    med_w = float(np.median([r[0] for r in valid]))
+    med_b = float(np.median([r[1] for r in valid]))
+    filled = [(r if r is not None else (med_w, med_b)) for r in results]
+
+    arr = np.array(filled, dtype=np.float32)   # shape (4, 2)
+    log.debug("Corner levels (white,black): TL=(%.0f,%.0f) TR=(%.0f,%.0f) "
+              "BR=(%.0f,%.0f) BL=(%.0f,%.0f)",
+              arr[0,0], arr[0,1], arr[1,0], arr[1,1],
+              arr[2,0], arr[2,1], arr[3,0], arr[3,1])
+    return arr
+
 
 def _apply_bilinear_correction(img_f: np.ndarray,
                                 aruco_corners: np.ndarray,
@@ -943,6 +1011,43 @@ def _process_grid(warped: np.ndarray, config: dict,
     TEXT_SPREAD_THRESH = config.get("text_spread_threshold", 25)
 
     grey       = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+
+    # ── CLAHE illumination correction ─────────────────────────────────────────
+    # The ArUco-corner bilinear correction operates before the warp and can
+    # fail (e.g. when corner level samples go off-image or hit the printed
+    # title area).  When it fails, the global stretch leaves local darkness
+    # uncorrected: the top of the sheet (near the instruction panel and
+    # template border) stays underlit, making blank paper cells read as nearly
+    # entirely below sixel_fill_threshold.  For a blank cell with fill_frac
+    # close to 1.0 and avg_s < 40, the CELL_WHITE_GFX gate fires → solid 0x7F
+    # white bands across the top of the page.
+    #
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization) corrects this
+    # after the warp, tile by tile.  clipLimit=2.0 prevents noise amplification
+    # in genuinely blank regions.
+    #
+    # CRITICAL: tileGridSize is the NUMBER OF TILES in each direction, NOT the
+    # pixel size of each tile.  Using COLS//4 × ROWS//4 gives ~10×6 = 60 tiles,
+    # each covering 4 teletext cells (~160×160 px).  At this scale CLAHE
+    # corrects the macro lighting gradient (shadow at sheet edges) without
+    # amplifying the contrast of printed grid lines within individual cells.
+    #
+    # The previous (wrong) computation W//(COLS//4) = 160 passed a PIXEL
+    # DIMENSION as a tile count, creating 160×160 = 25,600 micro-tiles each
+    # only 10×10 px (sub-cell scale).  That is effectively per-pixel
+    # normalisation: every printed grid-line crossing gets its contrast
+    # amplified to full range, pushing blank paper cells through the TEXT
+    # spread gate and causing Tesseract to OCR the grid pattern as characters.
+    #
+    # CLAHE is applied only to the greyscale image used for luminance-based
+    # classification (CELL_WHITE_GFX fill fraction, TEXT spread, EMPTY check).
+    # The colour classification (_classify_colour) operates on the original
+    # warped RGB image (pr) and is unaffected.
+    _n_tiles_w = max(2, COLS // 4)   # ~10 tiles → each covers ~4 cells wide
+    _n_tiles_h = max(2, ROWS // 4)   # ~6  tiles → each covers ~4 cells tall
+    grey = cv2.createCLAHE(clipLimit=2.0,
+                            tileGridSize=(_n_tiles_w, _n_tiles_h)).apply(grey)
+    # ─────────────────────────────────────────────────────────────────────────
     if warped_pil is None:
         warped_pil = Image.fromarray(warped)
     row_strings = []
@@ -1039,10 +1144,23 @@ def _process_grid(warped: np.ndarray, config: dict,
             #      — already guaranteed by _classify_colour returning NONE, but
             #      we re-check explicitly for clarity and configurability.
             #   2. Overall dark-pixel fill fraction >= white_gfx_fill_threshold
-            #      — separates dense shading from text strokes (5-20% fill).
+            #      — separates dense shading from text strokes AND from graph
+            #      paper grid lines.
+            #
+            #      Graph paper lines (0.3–0.5mm on a 5mm grid, ≈ same pitch as
+            #      one teletext cell) cross every cell and contribute ~30–40% of
+            #      its area as dark pixels on their own.  The old default of 0.30
+            #      sat right at that level, causing every boundary cell of a
+            #      drawing (where pencil is thin and grid lines dominate) to fire
+            #      as CELL_WHITE_GFX even when the user drew no white shading.
+            #
+            #      The new default of 0.50 requires more than half the cell to be
+            #      dark, which genuine achromatic shading reliably exceeds (60–
+            #      80% fill) while graph lines alone cannot.  Text strokes stay at
+            #      5–20%.  Update white_gfx_fill_threshold in config.py to match.
             #   3. At least one sixel sub-cell non-zero — same empty-cell guard
             #      used for coloured cells.
-            wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.30)
+            wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.50)
             wgfx_max_sat     = config.get("white_gfx_max_saturation", 40)
 
             # Compute fill fraction and mean saturation on the (possibly inset /
@@ -1218,13 +1336,16 @@ def _process_grid(warped: np.ndarray, config: dict,
                         if sub_rgb.size == 0:
                             continue
                         sub_colour = _classify_colour(sub_rgb, config)
-                        if sub_colour == row_bg:
+                        if sub_colour == row_bg or sub_colour in ("NONE", "WHITE"):
+                            # Background bucket: confirmed bg colour, unclassified
+                            # achromatic (NONE = grid-line or paper), or white
+                            # paper gap showing through a coloured fill.  All are
+                            # bit=0.  WHITE specifically: a paper gap inside a red
+                            # or cyan cell is not intentional white graphics; it
+                            # must render as background to avoid white spots.
                             pass
                         elif sub_colour != "NONE":
                             tti_bits |= (1 << bit_idx)
-                        else:
-                            if sub_gry.size > 0 and float(sub_gry.mean()) < sixel_thresh:
-                                tti_bits |= (1 << bit_idx)
                     tti_code = (0x60 + (tti_bits & 0x1F)) if (tti_bits & 0x20) else (0x20 + (tti_bits & 0x1F))
                     sixel_char = chr(tti_code)
                     sixel_code = tti_code
@@ -1535,8 +1656,15 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
         else:
             break
 
+    # Require leading_len >= 6 so that at least 3 content cells of the
+    # leading colour remain AFTER the 3-column preamble (cols 0-2) is
+    # written.  A leading run of exactly 3 fires the preamble but leaves
+    # nothing behind: all 3 content cells are overwritten, the recomputed
+    # bits clear to 0 (background), and the row renders as a solid colour
+    # band.  With leading_len >= 6, content at cols 3+ still carries the
+    # shape and the preamble earns its slot cost.
     if (leading_colour is not None
-            and leading_len >= 3
+            and leading_len >= 6
             and any(cell_colour[c] != leading_colour
                     for c in range(COLS)
                     if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
@@ -1713,9 +1841,17 @@ def _encode_row(warped, grey, warped_pil,
         # Decision logic per sub-cell:
         #   colour == row_bg          → bit=0  (definitely background)
         #   colour != row_bg, != NONE → bit=1  (clearly a different colour)
-        #   colour == NONE            → use greyscale as tiebreaker:
-        #                               greyscale mean < sixel_thresh → bit=1
-        #                               (ink present but too faint to classify)
+        #   colour == NONE            → bit=0  (background) — ALWAYS, whether
+        #                               the sub-cell reads as bright (white
+        #                               paper) or dark (a black grid-line).
+        #                               _classify_colour cannot distinguish
+        #                               the two — neither has chromatic
+        #                               saturation — so both must collapse to
+        #                               the same background bucket.  A prior
+        #                               greyscale tiebreaker promoted dark
+        #                               NONE pixels to foreground, which made
+        #                               grid-lines crossing a cell streak
+        #                               through in the cell's drawn colour.
         #
         # Recompute sixel patterns for every graphics cell in the row.
         # With bg=row_bg set, each sub-cell must be judged against the
@@ -1727,9 +1863,8 @@ def _encode_row(warped, grey, warped_pil,
         # For every graphics cell (any colour):
         #   sub-cell colour == row_bg          → bit=0 (show background)
         #   sub-cell colour == cell_colour (fg)→ bit=1 (show foreground)
-        #   sub-cell colour == NONE (achromatic/unclear):
-        #     row_bg is chromatic (e.g. CYN): dark greyscale → bit=1, bright → bit=0
-        #     row_bg is WHITE: all achromatic → bit=0 (white shading = background)
+        #   sub-cell colour == NONE (achromatic, bright OR dark) → bit=0
+        #     (always background — see above)
         #   sub-cell colour is a third colour: bit=1 (show as fg, best approximation)
         #
         # Cells already handled by the bg-colour path (cell_colour == row_bg)
@@ -1767,20 +1902,21 @@ def _encode_row(warped, grey, warped_pil,
                         continue
                     sub_colour = _classify_colour(sub_rgb, config)
                     if white_bg:
-                        # WHITE background: only fire bit=1 for saturated non-white
-                        # chromatic ink.  Achromatic shading and paper stay at bit=0
-                        # (show as white background).
+                        # WHITE background: only saturated non-white chromatic
+                        # ink fires bit=1.  Achromatic sub-cells (NONE) and
+                        # white paper are background.
                         if sub_colour not in ("NONE", "WHITE") and sub_colour not in SUPPRESS_COLOURS:
                             bits |= (1 << bit_idx)
-                    elif sub_colour == row_bg:
-                        pass   # definitely background — bit stays 0
-                    elif sub_colour != "NONE":
+                    elif sub_colour == row_bg or sub_colour in ("NONE", "WHITE"):
+                        # Confirmed background (matches bg colour), unclassified
+                        # achromatic (NONE = grid-line or paper), or white paper
+                        # gap showing through a coloured fill — all are bit=0.
+                        # WHITE specifically: paper gaps inside a red/cyan/etc.
+                        # cell are not intentional white graphics; treating them
+                        # as foreground would paint white spots over the shape.
+                        pass
+                    elif sub_colour not in SUPPRESS_COLOURS:
                         bits |= (1 << bit_idx)   # clearly a different colour
-                    else:
-                        # Ambiguous — greyscale tiebreaker only when colour
-                        # could not be identified (not when bg colour confirmed)
-                        if sub_gry.size > 0 and float(sub_gry.mean()) < sixel_thresh:
-                            bits |= (1 << bit_idx)
                 code = (0x60 + (bits & 0x1F)) if (bits & 0x20) else (0x20 + (bits & 0x1F))
                 out_chars[col] = chr(code)
         else:
@@ -1981,13 +2117,21 @@ def _encode_row(warped, grey, warped_pil,
                         if white_bg:
                             if sub_colour not in ("NONE", "WHITE") and sub_colour not in SUPPRESS_COLOURS:
                                 bits |= (1 << bit_idx)
-                        elif sub_colour == tgt_colour:
+                        elif sub_colour == tgt_colour or sub_colour in ("NONE", "WHITE"):
+                            # Background bucket: matches the block colour,
+                            # unclassified achromatic (NONE = grid-line / paper),
+                            # or white paper gap — all resolve to bit=0.
                             pass
-                        elif sub_colour != "NONE":
+                        elif sub_colour not in SUPPRESS_COLOURS:
                             bits |= (1 << bit_idx)
                         else:
-                            if sub_gry.size > 0 and float(sub_gry.mean()) < sixel_thresh:
-                                bits |= (1 << bit_idx)
+                            # Achromatic (NONE) sub-cell — bright paper or dark
+                            # grid-line, both unclassifiable by chroma alone.
+                            # Both resolve to background; previously a dark
+                            # NONE reading was promoted to foreground, letting
+                            # grid-lines crossing the cell streak through in
+                            # the block's colour.
+                            pass
                     code = (0x60 + (bits & 0x1F)) if (bits & 0x20) else (0x20 + (bits & 0x1F))
                     out_chars[recomp_col] = chr(code)
             else:
@@ -2434,25 +2578,10 @@ def get_warped_image(pil_image: Image.Image, config: dict):
     if not _CV2:
         return None
     try:
-        # 1. Convert to raw NumPy array first
-        raw_img_np = np.array(pil_image.convert("RGB"))
-
-        # 2. Locate the ArUco corners safely from the raw frame
-        corners = _find_grid_corners_via_aruco(raw_img_np, config)
-
-        # 3. Save corners inside config so _normalise_image can access them
-        config["aruco_corners"] = corners
-
-        # Also bind to a global fallback variable in case the function looks there
-        global global_aruco_corners
-        global_aruco_corners = corners
-
-        # 4. Run the normalization now that the data is primed
-        img_np = _normalise_image(raw_img_np)
-
-        # 5. Perform the final geometric warp
-        warped = _perspective_warp(img_np, corners,
-                                   config["warp_width"], config["warp_height"])
+        img_np  = _normalise_image(np.array(pil_image.convert("RGB")))
+        corners = _find_grid_corners_via_aruco(img_np, config)
+        warped  = _perspective_warp(img_np, corners,
+                                    config["warp_width"], config["warp_height"])
         return Image.fromarray(warped)
     except Exception as e:
         log.error("get_warped_image: %s", e)

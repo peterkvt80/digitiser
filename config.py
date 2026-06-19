@@ -133,22 +133,24 @@ DIGITISER = {
     "noise_spread_limit": 60,  # spread below this → EMPTY (dot-grid noise gate)
     "text_min_lum":     100,   # cell min-luminance must be below this → TEXT
 
-    # White graphics detection.
-    # A cell shaded densely with an achromatic pencil (no colour saturation)
-    # is classified as CELL_WHITE_GFX and emits ESC W (white graphics) plus
-    # the decoded sixel pattern.  The user draws the outline of their shape
-    # and fills it in; the software decides which sixel bits fire.
-    #
     # white_gfx_fill_threshold : fraction of cell pixels below sixel_fill_threshold
-    #     that must be dark to qualify.  30% separates dense shading from text
-    #     strokes (typically 5-20%).
-    # white_gfx_max_saturation : mean HSV saturation must be below this to
-    #     confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
+    #     that must be dark to qualify as achromatic (white) graphics.
+    #
+    #     Graph paper lines (0.3–0.5 mm on a 5 mm grid, roughly the same pitch as
+    #     one teletext cell) cross every cell and alone contribute ~30–40% dark
+    #     pixel coverage.  The old value of 0.30 fired on every boundary cell of a
+    #     drawing where pencil was thin and grid lines dominated, producing spurious
+    #     white graphics codes throughout the TTI.
+    #
+    #     0.50 requires more than half the cell to be dark — genuine achromatic
+    #     shading reliably reaches 60–80% fill; graph lines alone cannot exceed ~40%.
+    #     Lower this only if you are using very dense grey/white pencil shading.
+    #
+    # white_gfx_max_saturation : mean HSV saturation of ink pixels must be below
+    #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
     #     the colour classifier requires avg_s >= 50, so 40 sits safely below
     #     that with a 10-unit gap.
-    # Spurious white_gfx in rows with a non-black preamble background is
-    # prevented by the 60% coverage threshold in _pick_row_bg, not here.
-    "white_gfx_fill_threshold": 0.30,
+    "white_gfx_fill_threshold": 0.50,
     "white_gfx_max_saturation":   40,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
