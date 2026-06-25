@@ -1378,14 +1378,20 @@ class _CellInspector(tk.Toplevel):
         self._warped_orig = warped          # full-res, used for cell crops
         MAX_GRID_W = 900
         MAX_GRID_H = 560
-        orig_w, orig_h = warped.size
-        scale = min(MAX_GRID_W / orig_w, MAX_GRID_H / orig_h, 1.0)
-        if scale < 1.0:
-            disp_w = max(1, int(orig_w * scale))
-            disp_h = max(1, int(orig_h * scale))
-            self._warped = warped.resize((disp_w, disp_h), Image.BILINEAR)
-        else:
-            self._warped = warped
+        orig_w, orig_h = 1600, 960
+        # scale = min(MAX_GRID_W / orig_w, MAX_GRID_H / orig_h, 1.0)
+        COLS = 40
+        ROWS = 24
+        k = min(MAX_GRID_W // COLS, MAX_GRID_H // ROWS)
+        disp_w = k * COLS
+        disp_h = k * ROWS
+        #if scale < 1.0:
+        #    disp_w = max(1, int(orig_w * scale))
+        #    disp_h = max(1, int(orig_h * scale))
+        #    self._warped = warped.resize((disp_w, disp_h), Image.BILINEAR)
+        #else:
+        #    self._warped = warped
+        self._warped = warped
 
         self.DISP_W, self.DISP_H = self._warped.size
         self._config    = config

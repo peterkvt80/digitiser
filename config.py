@@ -150,7 +150,7 @@ DIGITISER = {
     #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
     #     the colour classifier requires avg_s >= 50, so 40 sits safely below
     #     that with a 10-unit gap.
-    "white_gfx_fill_threshold": 0.50,
+    "white_gfx_fill_threshold": 0.20,
     "white_gfx_max_saturation":   40,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
@@ -189,6 +189,22 @@ DIGITISER = {
         "grid_rows":   24,
         "sixel_cols":  2,
         "sixel_rows":  3,
+        # Border inset for the perspective warp destination quad.
+        #
+        # The ArUco inward corners coincide with the *outer* edge of the
+        # template's printed 6px border.  Mapping those corners straight to
+        # (0,0)…(dst_w,dst_h) pulls the border ink into the warp output,
+        # producing a dark strip at each edge.
+        #
+        # This value insets the destination quad inward so the border maps
+        # outside the output canvas.  Derived from template geometry:
+        #   bx = 6 * 1600 / 2540 ≈ 3.78  →  4 px
+        #   by = 6 *  960 / 1820 ≈ 3.16  →  3 px
+        #
+        # Use a dict {"x": bx, "y": by} for independent axis control, or a
+        # single int to apply the same inset to both axes.
+        # Set to 0 to disable.
+        "grid_border_warp_px": {"x": 4, "y": 3},
     },
 }
 

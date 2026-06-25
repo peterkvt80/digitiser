@@ -201,15 +201,20 @@ def digitise(pil_image: Image.Image, config: dict,
     # Initial normalisation without ArUco reference (grey-world + stretch)
     img_np = _normalise_image(img_np)
 
-    # Detect grid corners
-    corners = _find_grid_corners_via_aruco(img_np, config)
+    # Detect grid corners — returns (corners, found_markers)
+    corners, found_markers = _find_grid_corners_via_aruco(img_np, config)
+    corner_ids = (config.get("template_params") or {}).get("corner_ids", [0, 1, 2, 3])
 
-    # Re-normalise using detected marker corners as black/white reference
+    # Re-normalise using marker interiors as black/white reference
     img_raw = np.array(pil_image.convert("RGB"))
-    img_np  = _normalise_image(img_raw, aruco_corners=corners)
+    img_np  = _normalise_image(img_raw,
+                               aruco_corners=corners,
+                               marker_quads=found_markers,
+                               corner_ids=corner_ids)
 
     warped = _perspective_warp(img_np, corners,
-                               config["warp_width"], config["warp_height"])
+                               config["warp_width"], config["warp_height"],
+                               config)
     warped_pil = Image.fromarray(warped)
     rows, scan_data = _process_grid(warped, config, row_callback=row_callback,
                                     warped_pil=warped_pil)
@@ -262,11 +267,16 @@ def digitise_full(pil_image: Image.Image, config: dict,
     log.info("digitise_full %dx%d", pil_image.width, pil_image.height)
     img_np = np.array(pil_image.convert("RGB"))
     img_np = _normalise_image(img_np)
-    corners = _find_grid_corners_via_aruco(img_np, config)
+    corners, found_markers = _find_grid_corners_via_aruco(img_np, config)
+    corner_ids = (config.get("template_params") or {}).get("corner_ids", [0, 1, 2, 3])
     img_raw = np.array(pil_image.convert("RGB"))
-    img_np  = _normalise_image(img_raw, aruco_corners=corners)
+    img_np  = _normalise_image(img_raw,
+                               aruco_corners=corners,
+                               marker_quads=found_markers,
+                               corner_ids=corner_ids)
     warped  = _perspective_warp(img_np, corners,
-                                config["warp_width"], config["warp_height"])
+                                config["warp_width"], config["warp_height"],
+                                config)
     warped_pil = Image.fromarray(warped)
     rows, scan_data = _process_grid(warped, config, row_callback=row_callback,
                                     warped_pil=warped_pil)
@@ -275,36 +285,32 @@ def digitise_full(pil_image: Image.Image, config: dict,
 
 
 def _normalise_image(img: np.ndarray,
-                     aruco_corners: "np.ndarray | None" = None) -> np.ndarray:
+                     aruco_corners: "np.ndarray | None" = None,
+                     marker_quads: "dict | None" = None,
+                     corner_ids: "list | None" = None) -> np.ndarray:
     """
     Correct for camera colour cast and spatially-varying exposure using the
     four ArUco markers as local black/white reference patches.
 
-    Each marker provides a (white_ref, black_ref) luminance pair at its grid
-    corner.  These four anchor points define a bilinear correction surface:
-    for any pixel at normalised grid position (u, v) the local references are
-    interpolated from the four corners, and a per-pixel linear stretch maps
-    that pixel's value to the [0, 255] range.
+    Each marker's interior 4×4 data region (within the 6×6 total marker)
+    provides a (white_ref, black_ref) luminance pair.  These four anchor
+    points define a bilinear correction surface: for any pixel at normalised
+    grid position (u, v) the local references are interpolated from the four
+    corners, and a per-pixel linear stretch maps that pixel's value to the
+    [0, 255] range.
 
-    This corrects for lighting gradients across the sheet — e.g. a bright
-    lamp on one side that would otherwise make that side's pencil colours
-    appear washed-out and trigger false classifications.
+    Parameters
+    ----------
+    img          : uint8 RGB image
+    aruco_corners: (4,2) grid corner coords — used only for spatial interpolation
+    marker_quads : dict {marker_id: (4,2) quad} from _find_grid_corners_via_aruco
+                   When supplied, marker interiors are sampled for the reference
+                   levels.  This works regardless of whether the sheet fills the
+                   camera frame.
+    corner_ids   : list of 4 marker IDs matching aruco_corners order
 
-    If aruco_corners is not provided (first-pass call before detection),
-    falls back to grey-world white balance + global 98th-percentile stretch.
-
-    Steps
-    -----
-    1. Grey-world white balance (always) — removes gross colour cast.
-    2. If ArUco corners supplied:
-         a. Sample per-corner (white_ref, black_ref) at each of the four
-            markers using their quiet zones and dark modules.
-         b. Build bilinear correction maps white_map(y,x) and black_map(y,x)
-            by interpolating the four corner references across the full image.
-         c. Apply per-pixel stretch:
-               out = (in - black_map) / (white_map - black_map) * 255
-            clamped to [0, 255].
-    3. Otherwise: stretch so the 98th-percentile luminance reaches 240.
+    Falls back to grey-world + global 98th-percentile stretch when marker
+    quads are not available (first pass before detection).
     """
     img_f = img.astype(np.float32)
 
@@ -318,16 +324,16 @@ def _normalise_image(img: np.ndarray,
         img_f[:, :, 1] = np.clip(img_f[:, :, 1] * (overall / mean_g), 0, 255)
         img_f[:, :, 2] = np.clip(img_f[:, :, 2] * (overall / mean_b), 0, 255)
 
-    # Step 2: 2D bilinear correction from per-corner ArUco references
-    if aruco_corners is not None:
+    # Step 2: 2D bilinear correction from marker interior samples
+    if marker_quads is not None and aruco_corners is not None and corner_ids is not None:
         try:
-            corner_levels = _sample_corner_levels(img_f, aruco_corners)
+            corner_levels = _sample_marker_interiors(img_f, marker_quads, corner_ids)
             if corner_levels is not None:
                 img_f = _apply_bilinear_correction(img_f, aruco_corners,
                                                    corner_levels)
                 return img_f.astype(np.uint8)
         except Exception as e:
-            log.debug("ArUco 2D correction failed: %s", e)
+            log.debug("Marker interior 2D correction failed: %s", e)
 
     # Step 3: fallback — global exposure stretch from 98th percentile
     grey_f = 0.299*img_f[:, :, 0] + 0.587*img_f[:, :, 1] + 0.114*img_f[:, :, 2]
@@ -340,120 +346,105 @@ def _normalise_image(img: np.ndarray,
     return img_f.astype(np.uint8)
 
 
-def _sample_corner_levels(img_f: np.ndarray,
-                           aruco_corners: np.ndarray) -> "np.ndarray | None":
+def _sample_marker_interiors(img_f: np.ndarray,
+                              found_markers: dict,
+                              corner_ids: list) -> "np.ndarray | None":
     """
-    Sample per-corner (white_ref, black_ref) luminance from the four ArUco
-    markers.
+    Sample (white_ref, black_ref) from the interior of each detected ArUco
+    marker by perspective-warping each marker quad to a small square and
+    taking the min/max luminance of the inner 4/6 region.
 
-    aruco_corners : (4,2) float array, order TL, TR, BR, BL — these are the
-    inward grid corners.  Each marker sits **outside** the grid, so its body
-    extends outward from each grid corner.
+    The template uses DICT_4X4_50 markers which are 6×6 modules total:
+      - 1-module black border (outer ring)
+      - 4×4 data bit pattern inside
 
-    The ArUco marker structure (outward from grid corner):
-      - Immediately adjacent to the grid corner: the marker's black outer border
-      - Further out: the white quiet zone (unprinted paper)
+    By warping the detected quad to a 60×60 pixel square each module is
+    10×10 px.  Inset by 1/6 on each side (10 px) to exclude the outer
+    border, leaving a 40×40 px window covering only the 4×4 data interior.
 
-    Sampling positions (both in the outward direction from the grid corner):
-      white_ref : large outward offset — lands in the quiet zone (white paper)
-      black_ref : small outward offset — lands in the black border of the marker
+    Within that window:
+      black_ref = 5th-percentile luminance  (darkest modules = black data bits)
+      white_ref = 95th-percentile luminance (lightest modules = white data bits)
+
+    The data interior always contains both black and white modules because
+    the ArUco encoding guarantees sufficient transitions.  This works
+    regardless of whether the sheet fills the frame, because the sample
+    region is entirely within the marker itself.
+
+    Parameters
+    ----------
+    img_f        : float32 RGB image (pre grey-world balance)
+    found_markers: dict {marker_id: (4,2) float32 corner array}
+                   TL,TR,BR,BL corner order (OpenCV ArUco convention)
+    corner_ids   : list of 4 marker IDs [TL,TR,BR,BL] from config
 
     Returns
     -------
-    np.ndarray of shape (4, 2) — [[white_TL, black_TL], ...] or None.
+    np.ndarray shape (4,2) — [[white_TL, black_TL], ...] in corner_ids order,
+    or None if fewer than 3 markers yielded valid readings.
     """
-    H, W = img_f.shape[:2]
+    WARP_SIZE   = 60          # pixels — warp each marker to this square
+    INSET_FRAC  = 1.0 / 6.0  # inset by 1 module on each side
+    inset_px    = int(WARP_SIZE * INSET_FRAC)  # = 10 px
 
-    tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
-                      aruco_corners[2], aruco_corners[3])
+    dst_quad = np.array([
+        [0,         0        ],
+        [WARP_SIZE, 0        ],
+        [WARP_SIZE, WARP_SIZE],
+        [0,         WARP_SIZE],
+    ], dtype=np.float32)
 
-    # Estimate marker size from grid width.
-    # The marker is ~16mm wide; the grid is ~40 cells across ~200mm → 5mm/cell.
-    # So marker ≈ 3.2 cells → msz_est ≈ grid_width_px / 12.5.  Use /10 for margin.
-    grid_width_px = max(abs(tr[0] - tl[0]), abs(br[0] - bl[0]), 1.0)
-    msz_est = max(20, int(grid_width_px / 10))
-    patch_r = max(3, min(msz_est // 12, 8))  # small enough to stay within the border/quiet zone
+    img_grey = (0.299 * img_f[:, :, 0] +
+                0.587 * img_f[:, :, 1] +
+                0.114 * img_f[:, :, 2]).astype(np.float32)
 
-    # Outward offset magnitudes:
-    #   black border is close to the grid corner — use 30% of marker size.
-    #     At 30% of msz_est we are safely inside the marker body.
-    #   white quiet zone is JUST PAST the outer edge of the marker — use
-    #     120% of marker size.  The outer edge of the marker is at ~100% of
-    #     msz_est outward from the grid corner, so 120% lands in the quiet
-    #     zone (a few mm of unprinted paper).
-    #     Previous value was 80%, which sampled INSIDE the marker body and
-    #     always returned a dark reading → all corners failed the sanity check.
-    black_off = max(4, int(msz_est * 0.30))
-    white_off = max(8, int(msz_est * 1.20))
-
-    # Outward direction per corner (sign of dx, sign of dy):
-    # TL corner: outward is up-left  (-,-)
-    # TR corner: outward is up-right (+,-)
-    # BR corner: outward is down-right (+,+)
-    # BL corner: outward is down-left (-,+)
-    signs = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-
-    corners_list = [tl, tr, br, bl]
     results = []
+    for mid in corner_ids:
+        quad = found_markers.get(mid)
+        if quad is None:
+            log.debug("Marker %d not in found_markers — skipped", mid)
+            results.append(None)
+            continue
 
-    for i, (cx, cy) in enumerate(corners_list):
-        sx, sy = signs[i]
-        readings = {}
-        for key, off in [("black", black_off), ("white", white_off)]:
-            px = int(cx + sx * off)
-            py = int(cy + sy * off)
+        src_quad = quad.astype(np.float32)   # (4,2) TL,TR,BR,BL
+        M = cv2.getPerspectiveTransform(src_quad, dst_quad)
+        warped = cv2.warpPerspective(img_grey, M, (WARP_SIZE, WARP_SIZE))
 
-            # Bounds check: if the sample centre is outside the image, skip it.
-            # Without this, negative px/py values are clamped by max(0,...) on
-            # one end but min(W,...) returns a negative on the other, causing
-            # numpy to interpret the slice as a reverse-index (wrapping to the
-            # far end of the image) — producing completely wrong luminance
-            # readings.  A skipped reading is handled below as a missing key.
-            if not (patch_r <= px < W - patch_r and patch_r <= py < H - patch_r):
-                log.debug("Corner %d '%s': center (%d,%d) outside image "
-                          "[%dx%d] — skipped", i, key, px, py, W, H)
-                continue
+        # Crop to inner 4×4 data region (exclude outer black border)
+        interior = warped[inset_px : WARP_SIZE - inset_px,
+                          inset_px : WARP_SIZE - inset_px]
 
-            x0 = max(0, px - patch_r);  x1 = min(W, px + patch_r)
-            y0 = max(0, py - patch_r);  y1 = min(H, py + patch_r)
-            patch = img_f[y0:y1, x0:x1]
-            if patch.size > 0:
-                lum_vals = (0.299 * patch[:, :, 0] +
-                            0.587 * patch[:, :, 1] +
-                            0.114 * patch[:, :, 2]).ravel()
-                # Use 10th percentile for black (darkest pixels in patch),
-                # 90th percentile for white (brightest pixels in patch).
-                # This is robust when the sample window overlaps both ink and paper.
-                if key == "black":
-                    lum = float(np.percentile(lum_vals, 10))
-                else:
-                    lum = float(np.percentile(lum_vals, 90))
-                readings[key] = lum
+        if interior.size == 0:
+            log.debug("Marker %d: interior crop empty — skipped", mid)
+            results.append(None)
+            continue
 
-        if "white" in readings and "black" in readings:
-            w, b = readings["white"], readings["black"]
-            if w > b + 20:   # white must be clearly brighter than black
-                results.append((w, b))
-                log.debug("Corner %d: white=%.0f black=%.0f", i, w, b)
-            else:
-                log.debug("Corner %d: sanity failed white=%.0f black=%.0f", i, w, b)
-                results.append(None)
+        flat     = interior.ravel()
+        black_ref = float(np.percentile(flat,  5))
+        white_ref = float(np.percentile(flat, 95))
+
+        if white_ref > black_ref + 30:
+            results.append((white_ref, black_ref))
+            log.debug("Marker %d interior: white=%.0f  black=%.0f",
+                      mid, white_ref, black_ref)
         else:
+            log.debug("Marker %d interior: sanity failed white=%.0f black=%.0f",
+                      mid, white_ref, black_ref)
             results.append(None)
 
     valid = [r for r in results if r is not None]
     if len(valid) < 3:
-        log.warning("Only %d/4 ArUco corners yielded valid level readings", len(valid))
+        log.warning("Only %d/4 ArUco markers yielded valid interior readings",
+                    len(valid))
         return None
 
-    # Fill any missing corner with the median of the valid readings
     med_w = float(np.median([r[0] for r in valid]))
     med_b = float(np.median([r[1] for r in valid]))
     filled = [(r if r is not None else (med_w, med_b)) for r in results]
 
-    arr = np.array(filled, dtype=np.float32)   # shape (4, 2)
-    log.debug("Corner levels (white,black): TL=(%.0f,%.0f) TR=(%.0f,%.0f) "
-              "BR=(%.0f,%.0f) BL=(%.0f,%.0f)",
+    arr = np.array(filled, dtype=np.float32)   # shape (4,2)
+    log.debug("Marker interior levels (white,black): "
+              "TL=(%.0f,%.0f) TR=(%.0f,%.0f) BR=(%.0f,%.0f) BL=(%.0f,%.0f)",
               arr[0,0], arr[0,1], arr[1,0], arr[1,1],
               arr[2,0], arr[2,1], arr[3,0], arr[3,1])
     return arr
@@ -536,14 +527,17 @@ _white_balance = _normalise_image
 
 
 def _sample_marker_levels(img_f: np.ndarray,
-                           aruco_corners: np.ndarray) -> tuple:
+                           aruco_corners: np.ndarray,
+                           found_markers: "dict | None" = None,
+                           corner_ids: "list | None" = None) -> tuple:
     """
     Compatibility wrapper: returns (white_ref, black_ref) medians across all
-    four corners.  Used by calibration.py and any external callers that expect
-    the old single-value interface.  The main digitiser pipeline now uses
-    _sample_corner_levels directly for per-corner 2D correction.
+    four markers.  Used by calibration.py and any external callers that expect
+    the old single-value interface.
     """
-    levels = _sample_corner_levels(img_f, aruco_corners)
+    if found_markers is None or corner_ids is None:
+        return None, None
+    levels = _sample_marker_interiors(img_f, found_markers, corner_ids)
     if levels is None:
         return None, None
     white_ref = float(np.median(levels[:, 0]))
@@ -575,7 +569,14 @@ def _sample_marker_levels(img_f: np.ndarray,
 _INWARD_CORNER = {0: 3, 1: 2, 2: 1, 3: 0}
 
 
-def _find_grid_corners_via_aruco(img: np.ndarray, config: dict) -> np.ndarray:
+def _find_grid_corners_via_aruco(img: np.ndarray, config: dict) -> tuple:
+    """
+    Returns (grid_corners, found_markers) where:
+      grid_corners   : (4,2) float32 array — TL,TR,BR,BL inward grid corners
+      found_markers  : dict {marker_id: (4,2) float32} — full quad of each
+                       detected marker, keyed by the marker IDs from corner_ids.
+                       Used by _sample_marker_interiors for exposure correction.
+    """
     tp = config.get("template_params")
     if tp is None:
         raise DigitiserError(
@@ -630,7 +631,7 @@ def _find_grid_corners_via_aruco(img: np.ndarray, config: dict) -> np.ndarray:
     log.info("Grid TL=(%d,%d) TR=(%d,%d) BR=(%d,%d) BL=(%d,%d)",
              result[0,0],result[0,1], result[1,0],result[1,1],
              result[2,0],result[2,1], result[3,0],result[3,1])
-    return result
+    return result, found
 
 
 def _detect_all_markers(grey, detector, wanted_ids) -> dict:
@@ -677,9 +678,50 @@ def _make_detector(aruco_dict):
         return aruco_dict
 
 
-def _perspective_warp(img, corners, dst_w, dst_h):
-    dst = np.array([[0,0],[dst_w,0],[dst_w,dst_h],[0,dst_h]], dtype=np.float32)
-    M   = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
+def _perspective_warp(img, corners, dst_w, dst_h, config=None):
+    """
+    Perspective-warp the grid region to a dst_w × dst_h output image.
+
+    The four detected ArUco inward corners coincide with the *outer* edge of
+    the template's printed border (GRID_BORDER_PX = 6 px at 300 DPI).  If we
+    map those corners straight to (0,0)…(dst_w,dst_h), the border ink warps
+    into the first few rows/columns of the output and appears as a dark strip.
+
+    Fix: inset the *destination* quad inward by the border width expressed in
+    warp-output pixels.  This tells getPerspectiveTransform "the outer-border
+    corner maps to pixel (bx, by) in the output" — so the border itself lands
+    outside the output canvas and is never rendered.  The source corners are
+    unchanged; only the destination mapping shifts.
+
+    Border width in warp pixels:
+        bx = GRID_BORDER_PX * dst_w / grid_outer_w_print
+        by = GRID_BORDER_PX * dst_h / grid_outer_h_print
+
+    From the standard template at 300 DPI:
+        grid outer width  ≈ 2540 print px  → bx = 6*1600/2540 ≈ 3.78 → 4 px
+        grid outer height ≈ 1820 print px  → by = 6*960/1820  ≈ 3.16 → 3 px
+
+    These values are exposed as template_params["grid_border_warp_px"] so they
+    can be overridden without touching code.  A dict {"x": bx, "y": by} or a
+    single int are both accepted.
+    """
+    tp = (config or {}).get("template_params") or {}
+    raw = tp.get("grid_border_warp_px", {"x": 4, "y": 3})
+    if isinstance(raw, dict):
+        bx = float(raw.get("x", 4))
+        by = float(raw.get("y", 3))
+    else:
+        bx = by = float(raw)
+
+    # Destination quad: TL, TR, BR, BL — inset by (bx, by) on each side.
+    dst = np.array([
+        [bx,          by         ],
+        [dst_w - bx,  by         ],
+        [dst_w - bx,  dst_h - by ],
+        [bx,          dst_h - by ],
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
     return cv2.warpPerspective(img, M, (dst_w, dst_h))
 
 
@@ -1011,6 +1053,7 @@ def _process_grid(warped: np.ndarray, config: dict,
     TEXT_SPREAD_THRESH = config.get("text_spread_threshold", 25)
 
     grey       = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+    grey_raw   = grey.copy()   # pre-CLAHE, used for raw min-lum gate (see below)
 
     # ── CLAHE illumination correction ─────────────────────────────────────────
     # The ArUco-corner bilinear correction operates before the warp and can
@@ -1065,7 +1108,8 @@ def _process_grid(warped: np.ndarray, config: dict,
 
         for col in range(COLS):
             x0c = int(col * cw);  x1c = int((col+1) * cw)
-            pg  = grey[y0:y1, x0c:x1c]
+            pg     = grey[y0:y1, x0c:x1c]       # CLAHE greyscale
+            pg_raw = grey_raw[y0:y1, x0c:x1c]   # pre-CLAHE greyscale (for min-lum gate)
             pr  = warped[y0:y1, x0c:x1c]
 
             if pg.size == 0:
@@ -1092,8 +1136,9 @@ def _process_grid(warped: np.ndarray, config: dict,
                     c1 = (x1c - x0c) - bi if on_right  else (x1c - x0c)
                     # Only apply if the inset still leaves a usable patch
                     if r1 > r0 + 2 and c1 > c0 + 2:
-                        pg = pg[r0:r1, c0:c1]
-                        pr = pr[r0:r1, c0:c1]
+                        pg     = pg[r0:r1, c0:c1]
+                        pg_raw = pg_raw[r0:r1, c0:c1]
+                        pr     = pr[r0:r1, c0:c1]
 
             # ── Three-way cell classifier ─────────────────────────────────────
             #
@@ -1216,14 +1261,21 @@ def _process_grid(warped: np.ndarray, config: dict,
                 spread_hi_thresh = config.get("noise_spread_limit", 50)
                 min_lum_thresh   = config.get("text_min_lum",      100)
                 dark_px = int((pg < sixel_thresh).sum())
+                # Use the raw (pre-CLAHE) minimum for the min-lum gate.
+                # CLAHE amplifies graph paper grid lines (raw min ~103-153)
+                # to appear as dark as real pencil strokes (CLAHE min 49-83),
+                # causing blank-paper cells to pass the min-lum gate.
+                # The raw minimum separates them cleanly: graph lines stay
+                # at raw_min ≥ 100, real pencil strokes reach raw_min < 100.
+                raw_lum_min = float(pg_raw.min())
                 if (dark_px < ink_px_thresh
                         or lum_spread < spread_hi_thresh
-                        or lum_min >= min_lum_thresh):
+                        or raw_lum_min >= min_lum_thresh):
                     cell_type.append(CELL_EMPTY)
                     cell_colour.append("NONE")
                     cell_sixel.append(" ")
-                    log.debug("R%d C%d: demoted to EMPTY (ink=%d spread=%.0f min_lum=%.0f)",
-                              row, col, dark_px, lum_spread, lum_min)
+                    log.debug("R%d C%d: demoted to EMPTY (ink=%d spread=%.0f raw_min=%.0f)",
+                              row, col, dark_px, lum_spread, raw_lum_min)
                 else:
                     cell_type.append(CELL_TEXT)
                     cell_colour.append("WHITE")
@@ -2579,9 +2631,10 @@ def get_warped_image(pil_image: Image.Image, config: dict):
         return None
     try:
         img_np  = _normalise_image(np.array(pil_image.convert("RGB")))
-        corners = _find_grid_corners_via_aruco(img_np, config)
+        corners, _ = _find_grid_corners_via_aruco(img_np, config)
         warped  = _perspective_warp(img_np, corners,
-                                    config["warp_width"], config["warp_height"])
+                                    config["warp_width"], config["warp_height"],
+                                    config)
         return Image.fromarray(warped)
     except Exception as e:
         log.error("get_warped_image: %s", e)
