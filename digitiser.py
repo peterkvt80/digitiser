@@ -454,20 +454,19 @@ def _apply_bilinear_correction(img_f: np.ndarray,
                                 aruco_corners: np.ndarray,
                                 corner_levels: np.ndarray) -> np.ndarray:
     """
-    Apply a spatially-varying linear stretch to img_f using bilinear
+    Apply a spatially-varying brightness correction to img_f using bilinear
     interpolation of the four corner (white, black) references.
 
-    For each pixel at image coordinates (x, y), the normalised position
-    within the bounding rectangle of the four corners is:
-        u = (x - x_min) / (x_max - x_min)
-        v = (y - y_min) / (y_max - y_min)
-
-    The local references are bilinearly interpolated:
-        white(u,v) = (1-u)(1-v)*W_TL + u(1-v)*W_TR + uv*W_BR + (1-u)v*W_BL
-        black(u,v) = same with B values
-
-    The per-pixel stretch is:
-        out = (in - black(u,v)) / (white(u,v) - black(u,v)) * 255
+    The ArUco marker interior gives luminance-only references (black and white
+    modules, greyscale).  The correction is therefore applied as a luminance
+    gain: for each pixel, compute how much the local luminance should be
+    scaled to map black_ref→0 and white_ref→255, then apply that same gain
+    to all three RGB channels proportionally.  This preserves hue and
+    saturation — it is a brightness correction, not an independent per-channel
+    stretch.  Applying the stretch per-channel independently would amplify any
+    pre-existing colour cast from camera vignetting or lighting unevenness,
+    because each channel sees different absolute levels but the same
+    luminance-derived stretch factor.
 
     corner_levels : (4,2) array — [[W_TL,B_TL],[W_TR,B_TR],[W_BR,B_BR],[W_BL,B_BL]]
     aruco_corners : (4,2) — TL,TR,BR,BL grid corner pixel coordinates
@@ -477,7 +476,6 @@ def _apply_bilinear_correction(img_f: np.ndarray,
     tl, tr, br, bl = (aruco_corners[0], aruco_corners[1],
                       aruco_corners[2], aruco_corners[3])
 
-    # Bounding box of the four corners — defines the u,v domain
     xs = np.array([tl[0], tr[0], br[0], bl[0]])
     ys = np.array([tl[1], tr[1], br[1], bl[1]])
     x_min, x_max = float(xs.min()), float(xs.max())
@@ -490,35 +488,43 @@ def _apply_bilinear_correction(img_f: np.ndarray,
     W_BR, B_BR = float(corner_levels[2, 0]), float(corner_levels[2, 1])
     W_BL, B_BL = float(corner_levels[3, 0]), float(corner_levels[3, 1])
 
-    # Build u, v coordinate arrays for the full image — shape (H, W)
-    # Clamp to [0,1] so pixels outside the grid bounding box get the nearest
-    # corner's correction rather than an extrapolated value.
     x_coords = np.arange(W, dtype=np.float32)
     y_coords = np.arange(H, dtype=np.float32)
-    u = np.clip((x_coords - x_min) / span_x, 0.0, 1.0)   # shape (W,)
-    v = np.clip((y_coords - y_min) / span_y, 0.0, 1.0)    # shape (H,)
+    u = np.clip((x_coords - x_min) / span_x, 0.0, 1.0)
+    v = np.clip((y_coords - y_min) / span_y, 0.0, 1.0)
     u2d = u[np.newaxis, :]   # (1, W)
     v2d = v[:, np.newaxis]   # (H, 1)
 
-    # Bilinear interpolation of white and black reference maps
-    # w00=TL, w10=TR (right), w11=BR, w01=BL (bottom-left)
+    # Bilinear interpolation of white and black reference maps — shape (H, W)
     white_map = ((1-u2d)*(1-v2d)*W_TL + u2d*(1-v2d)*W_TR
-               + u2d*v2d*W_BR       + (1-u2d)*v2d*W_BL)  # (H, W)
+               + u2d*v2d*W_BR       + (1-u2d)*v2d*W_BL)
     black_map = ((1-u2d)*(1-v2d)*B_TL + u2d*(1-v2d)*B_TR
-               + u2d*v2d*B_BR       + (1-u2d)*v2d*B_BL)  # (H, W)
+               + u2d*v2d*B_BR       + (1-u2d)*v2d*B_BL)
+    span_map  = np.maximum(white_map - black_map, 1.0)
 
-    span_map = np.maximum(white_map - black_map, 1.0)   # (H, W)
+    # Compute the per-pixel luminance of the image (same weights used for
+    # sampling the greyscale marker interior).
+    lum = (0.299 * img_f[:, :, 0] +
+           0.587 * img_f[:, :, 1] +
+           0.114 * img_f[:, :, 2])   # (H, W)
 
-    # Apply per-pixel stretch to each channel — add axis for broadcasting
-    white_map3 = white_map[:, :, np.newaxis]   # (H, W, 1)
-    span_map3  = span_map[:, :, np.newaxis]
+    # The corrected luminance: stretch lum from [black_map, white_map] → [0, 255]
+    lum_corrected = np.clip((lum - black_map) / span_map * 255.0, 0.0, 255.0)
 
-    out = np.clip((img_f - white_map3 + span_map3) * (255.0 / span_map3), 0.0, 255.0)
-    # Equivalent to: (img_f - black_map3) / span_map3 * 255, but avoids a
-    # separate black_map3 broadcast:
-    #   (img_f - black) / (white - black) * 255
-    #   = (img_f - (white - span)) / span * 255
-    #   = (img_f - white + span) / span * 255
+    # Gain = corrected / original luminance — scalar field (H, W).
+    # Where lum is near zero (very dark pixels), gain is clamped to avoid
+    # divide-by-zero and explosive amplification of noise.
+    lum_safe = np.maximum(lum, 1.0)
+    gain = lum_corrected / lum_safe   # (H, W)
+
+    # Clamp gain to [0.5, 3.0]: never more than 3× brighten or 0.5× darken.
+    # This prevents the correction from introducing artefacts in corners where
+    # the bilinear surface is poorly constrained.
+    gain = np.clip(gain, 0.5, 3.0)
+
+    # Apply the same luminance gain to all three channels — preserves hue.
+    gain3 = gain[:, :, np.newaxis]   # (H, W, 1)
+    out   = np.clip(img_f * gain3, 0.0, 255.0)
     return out.astype(np.float32)
 
 
@@ -1682,6 +1688,29 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
     if (count / COLS >= 0.60
             and count / len(gfx_colours) >= 0.60
             and len(gfx_colours) > count):
+        # Veto any background colour when a *chromatic* minority colour has a
+        # contiguous run of ≥ 3 cells in the row.  Setting a background in that
+        # case causes those minority cells to render as coloured blocks on the
+        # background colour rather than on black — visible streaks.
+        # WHITE is exempt: white graphics on any background renders correctly
+        # (the encoder emits ESC W to switch to white before the block).
+        # The most common case: seal body (red) cells appear in the same row as
+        # dominant cloud/sky cells — any background choice makes the red cells
+        # render red-on-background instead of the correct red-on-black.
+        CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
+        minority_chromatic = {c for c in gfx_colours
+                              if c != most_common
+                              and c in CHROMATIC_MINORITY}
+        for check_colour in minority_chromatic:
+            run = 0
+            for c in range(COLS):
+                if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                        and cell_colour[c] == check_colour):
+                    run += 1
+                    if run >= 3:
+                        return None   # veto: chromatic minority run too long
+                else:
+                    run = 0
         return most_common
 
     # ── Path B: leading run from col 0 ────────────────────────────────────────
@@ -1721,6 +1750,28 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
                     for c in range(COLS)
                     if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
                     and cell_colour[c] not in SUPPRESS_COLOURS)):
+        # Same chromatic-minority-run veto as Path A: if any non-white chromatic
+        # colour other than the leading colour has a run of ≥ 3 cells, don't
+        # set a background — those cells would render as coloured blocks on it.
+        # WHITE is exempt (white graphics on any background is intentional).
+        CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
+        minority_chromatic = {
+            cell_colour[c] for c in range(COLS)
+            if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+            and cell_colour[c] not in SUPPRESS_COLOURS
+            and cell_colour[c] != leading_colour
+            and cell_colour[c] in CHROMATIC_MINORITY
+        }
+        for check_colour in minority_chromatic:
+            run = 0
+            for c in range(COLS):
+                if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                        and cell_colour[c] == check_colour):
+                    run += 1
+                    if run >= 3:
+                        return None
+                else:
+                    run = 0
         return leading_colour
 
     return None
@@ -1928,6 +1979,13 @@ def _encode_row(warped, grey, warped_pil,
                 if not (cell_type[col] in (CELL_GRAPHICS, CELL_WHITE_GFX)
                         and cell_colour[col] not in SUPPRESS_COLOURS):
                     continue
+                # CELL_WHITE_GFX: sixel bits were decoded from pencil darkness
+                # by _decode_sixels (luminance-based) and are already correct.
+                # Sub-cell colour classification always returns NONE for achromatic
+                # grey pencil, which would zero every bit.  Skip recompute entirely
+                # and leave the Pass 1 sixel char in place.
+                if cell_type[col] == CELL_WHITE_GFX:
+                    continue
                 y0_c = int(row * cell_h)
                 y1_c = int(y0_c + cell_h)
                 x0_c = int(col * cw)
@@ -2028,10 +2086,30 @@ def _encode_row(warped, grey, warped_pil,
 
         # BG-COLOUR CELLS: when row_bg is active, cells whose colour matches
         # the background show through the inverted (cleared) sixel bits —
-        # no control code is needed or wanted.  The held sixel is not updated
-        # from these cells (they display as background, not as a distinct glyph).
+        # no control code is needed or wanted.
         if row_bg is not None and tgt_colour == row_bg:
             continue
+
+        # ISOLATED-RUN SUPPRESSION: when a row background is active, a very
+        # short run of a different colour (≤ 2 cells) produces a control code
+        # that switches colour for only 1-2 characters then switches back.
+        # The visual result is a bright streak (e.g. red blocks cutting through
+        # a white-background cloud row).  These short runs are typically outline
+        # strokes or bleed from adjacent coloured areas and look better rendered
+        # as the row background than as isolated foreign-colour blocks.
+        # Suppress the control code: the cells will show as row_bg via their
+        # inverted (zeroed) sixel bits.
+        if row_bg is not None and tgt_colour != row_bg:
+            run_len = 0
+            for _c in range(col, COLS):
+                if (cell_type[_c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                        and cell_colour[_c] == tgt_colour
+                        and cell_colour[_c] not in SUPPRESS_COLOURS):
+                    run_len += 1
+                else:
+                    break
+            if run_len <= 2:
+                continue   # suppress — render as row_bg
 
         # REDUNDANCY SUPPRESSION: skip if colour/mode already correct.
         if mode == current_mode and tgt_colour == current_colour:
@@ -2142,6 +2220,9 @@ def _encode_row(warped, grey, warped_pil,
                     if not (cell_type[recomp_col] in (CELL_GRAPHICS, CELL_WHITE_GFX)
                             and cell_colour[recomp_col] == tgt_colour
                             and cell_colour[recomp_col] not in SUPPRESS_COLOURS):
+                        continue
+                    # CELL_WHITE_GFX: sixel bits are luminance-based; skip recompute.
+                    if cell_type[recomp_col] == CELL_WHITE_GFX:
                         continue
                     y0_c  = int(row * cell_h)
                     y1_c  = int(y0_c + cell_h)

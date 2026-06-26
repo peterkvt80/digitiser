@@ -150,7 +150,7 @@ DIGITISER = {
     #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
     #     the colour classifier requires avg_s >= 50, so 40 sits safely below
     #     that with a 10-unit gap.
-    "white_gfx_fill_threshold": 0.20,
+    "white_gfx_fill_threshold": 0.35,
     "white_gfx_max_saturation":   40,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
