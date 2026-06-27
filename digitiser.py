@@ -699,32 +699,46 @@ def _perspective_warp(img, corners, dst_w, dst_h, config=None):
     outside the output canvas and is never rendered.  The source corners are
     unchanged; only the destination mapping shifts.
 
-    Border width in warp pixels:
-        bx = GRID_BORDER_PX * dst_w / grid_outer_w_print
-        by = GRID_BORDER_PX * dst_h / grid_outer_h_print
+    The printed border maps to different pixel offsets at each edge because
+    the camera is never perfectly perpendicular to the sheet.  The config
+    therefore supports independent insets for all four edges:
 
-    From the standard template at 300 DPI:
-        grid outer width  ≈ 2540 print px  → bx = 6*1600/2540 ≈ 3.78 → 4 px
-        grid outer height ≈ 1820 print px  → by = 6*960/1820  ≈ 3.16 → 3 px
+        {"top": bt, "bottom": bb, "left": bl, "right": br}
 
-    These values are exposed as template_params["grid_border_warp_px"] so they
-    can be overridden without touching code.  A dict {"x": bx, "y": by} or a
-    single int are both accepted.
+    Backward-compatible shorthand forms are also accepted:
+        {"x": bx, "y": by}   — symmetric left/right and top/bottom
+        <int>                 — same inset on all four edges
+
+    These values are empirical — measure the dark border strip in a warped
+    output image and set each edge inset to match its thickness.  See the
+    comment in config.py for how to do this.
     """
     tp = (config or {}).get("template_params") or {}
-    raw = tp.get("grid_border_warp_px", {"x": 4, "y": 3})
-    if isinstance(raw, dict):
-        bx = float(raw.get("x", 4))
-        by = float(raw.get("y", 3))
-    else:
-        bx = by = float(raw)
+    raw = tp.get("grid_border_warp_px", {"top": 9, "bottom": 13, "left": 6, "right": 6})
 
-    # Destination quad: TL, TR, BR, BL — inset by (bx, by) on each side.
+    if isinstance(raw, dict):
+        # Per-edge form: {"top", "bottom", "left", "right"}
+        # Also accept old {"x", "y"} symmetric form for backward compat.
+        if "top" in raw or "bottom" in raw or "left" in raw or "right" in raw:
+            bt = float(raw.get("top",    raw.get("y", 9)))
+            bb = float(raw.get("bottom", raw.get("y", 13)))
+            bl = float(raw.get("left",   raw.get("x", 6)))
+            br = float(raw.get("right",  raw.get("x", 6)))
+        else:
+            # Old {"x": bx, "y": by} form — symmetric per axis
+            bx = float(raw.get("x", 6))
+            by = float(raw.get("y", 9))
+            bl = br = bx
+            bt = bb = by
+    else:
+        bt = bb = bl = br = float(raw)
+
+    # Destination quad: TL, TR, BR, BL — inset independently per edge.
     dst = np.array([
-        [bx,          by         ],
-        [dst_w - bx,  by         ],
-        [dst_w - bx,  dst_h - by ],
-        [bx,          dst_h - by ],
+        [bl,          bt         ],   # TL
+        [dst_w - br,  bt         ],   # TR
+        [dst_w - br,  dst_h - bb ],   # BR
+        [bl,          dst_h - bb ],   # BL
     ], dtype=np.float32)
 
     M = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)

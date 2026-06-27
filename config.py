@@ -197,14 +197,31 @@ DIGITISER = {
         # producing a dark strip at each edge.
         #
         # This value insets the destination quad inward so the border maps
-        # outside the output canvas.  Derived from template geometry:
-        #   bx = 6 * 1600 / 2540 ≈ 3.78  →  4 px
-        #   by = 6 *  960 / 1820 ≈ 3.16  →  3 px
+        # outside the output canvas, eliminating the dark strip and ensuring
+        # the cell grid overlay aligns with the image content.
         #
-        # Use a dict {"x": bx, "y": by} for independent axis control, or a
-        # single int to apply the same inset to both axes.
-        # Set to 0 to disable.
-        "grid_border_warp_px": {"x": 4, "y": 3},
+        # Because the camera is never perfectly perpendicular, the printed
+        # border maps to DIFFERENT pixel offsets at each of the four edges.
+        # A single symmetric value cannot fix all four simultaneously, so
+        # the config accepts independent per-edge values:
+        #
+        #   {"top": bt, "bottom": bb, "left": bl, "right": br}
+        #
+        # How to measure: open a warped image in an image editor or use the
+        # SHOW WARPED button.  Scan inward from each edge and note the first
+        # row/col that is not dark border ink (lum > ~150 in the left-10px
+        # edge strip).  Set each value to that row/col number.
+        #
+        # Measured on this camera/mount setup:
+        #   top:    9  (sealion image: border ends at row 6, horse: <9 sufficient)
+        #   bottom: 13 (horse image: border visible at rows 949-952, H-by must be <948)
+        #   left:   6  (sealion image: remaining 2px after old bx=4; horse: clean at 6)
+        #   right:  6  (symmetric with left, conservative)
+        #
+        # Backward-compatible shorthand also accepted:
+        #   {"x": bx, "y": by}   symmetric left/right and symmetric top/bottom
+        #   <int>                 same inset on all four edges
+        "grid_border_warp_px": {"top": -4, "bottom": -4, "left": 2, "right": 4},
     },
 }
 
