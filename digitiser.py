@@ -1228,10 +1228,28 @@ def _process_grid(warped: np.ndarray, config: dict,
             wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.50)
             wgfx_max_sat     = config.get("white_gfx_max_saturation", 40)
 
-            # Compute fill fraction and mean saturation on the (possibly inset /
-            # grid-line-suppressed) patch.
-            total_px   = pg.size
-            dark_px    = int((pg < sixel_thresh).sum())
+            # Compute fill fraction on the PRE-CLAHE greyscale patch (pg_raw),
+            # NOT the CLAHE-processed patch (pg).
+            #
+            # CLAHE is designed to enhance local contrast for the TEXT spread
+            # and empty-brightness gates.  But it massively inflates fill
+            # fractions on blank paper: an empty cell has raw fill ≈14% below
+            # sixel_fill_threshold, but CLAHE pushes it to ≈69%.  A horse
+            # outline cell (raw ≈19%) becomes ≈78% under CLAHE — far above
+            # any reasonable white_gfx threshold.
+            #
+            # Using the raw greyscale with the same sixel_fill_threshold gives
+            # honest ink coverage:
+            #   empty paper:          raw fill ≈ 0.03–0.15
+            #   black outline stroke: raw fill ≈ 0.05–0.35
+            #   genuine grey shading: raw fill ≈ 0.35–0.80
+            # A threshold of 0.50 (white_gfx_fill_threshold) cleanly separates
+            # genuine shading from outlines and blank paper.
+            #
+            # Note: avg_s is still computed from the RGB patch (pr) which is
+            # unaffected by CLAHE.  The mean saturation measurement is correct.
+            total_px   = pg_raw.size
+            dark_px    = int((pg_raw < sixel_thresh).sum())
             fill_frac  = dark_px / max(1, total_px)
 
             hsv_pr = cv2.cvtColor(pr, cv2.COLOR_RGB2HSV)
@@ -1711,20 +1729,30 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
         # The most common case: seal body (red) cells appear in the same row as
         # dominant cloud/sky cells — any background choice makes the red cells
         # render red-on-background instead of the correct red-on-black.
-        CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
-        minority_chromatic = {c for c in gfx_colours
-                              if c != most_common
-                              and c in CHROMATIC_MINORITY}
-        for check_colour in minority_chromatic:
-            run = 0
-            for c in range(COLS):
-                if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
-                        and cell_colour[c] == check_colour):
-                    run += 1
-                    if run >= 3:
-                        return None   # veto: chromatic minority run too long
-                else:
-                    run = 0
+        #
+        # Special case: when the DOMINANT colour is WHITE (CELL_WHITE_GFX), the
+        # minority-run veto is lifted entirely.  With WHITE as the background,
+        # every other colour (including RED) receives its own ESC control code
+        # before its block and renders correctly on the white background — no
+        # sixel inversion or colour-bleed occurs.  Without this exemption, rows
+        # like the cloud/mountain transition that are mostly white shading with
+        # a small red seal-body run get no preamble at all, leaving control-code
+        # slots black (default background) instead of white.
+        if most_common != "WHITE":
+            CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
+            minority_chromatic = {c for c in gfx_colours
+                                  if c != most_common
+                                  and c in CHROMATIC_MINORITY}
+            for check_colour in minority_chromatic:
+                run = 0
+                for c in range(COLS):
+                    if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                            and cell_colour[c] == check_colour):
+                        run += 1
+                        if run >= 3:
+                            return None   # veto: chromatic minority run too long
+                    else:
+                        run = 0
         return most_common
 
     # ── Path B: leading run from col 0 ────────────────────────────────────────
@@ -1767,25 +1795,28 @@ def _pick_row_bg(cell_type: list, cell_colour: list, COLS: int) -> "str | None":
         # Same chromatic-minority-run veto as Path A: if any non-white chromatic
         # colour other than the leading colour has a run of ≥ 3 cells, don't
         # set a background — those cells would render as coloured blocks on it.
-        # WHITE is exempt (white graphics on any background is intentional).
-        CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
-        minority_chromatic = {
-            cell_colour[c] for c in range(COLS)
-            if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
-            and cell_colour[c] not in SUPPRESS_COLOURS
-            and cell_colour[c] != leading_colour
-            and cell_colour[c] in CHROMATIC_MINORITY
-        }
-        for check_colour in minority_chromatic:
-            run = 0
-            for c in range(COLS):
-                if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
-                        and cell_colour[c] == check_colour):
-                    run += 1
-                    if run >= 3:
-                        return None
-                else:
-                    run = 0
+        # WHITE is exempt (white graphics on any background is intentional),
+        # and so is the case where the leading colour itself is WHITE — in that
+        # case every other colour gets its own ESC code and renders correctly.
+        if leading_colour != "WHITE":
+            CHROMATIC_MINORITY = {"RED","GREEN","YELLOW","BLUE","MAGENTA"}
+            minority_chromatic = {
+                cell_colour[c] for c in range(COLS)
+                if cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                and cell_colour[c] not in SUPPRESS_COLOURS
+                and cell_colour[c] != leading_colour
+                and cell_colour[c] in CHROMATIC_MINORITY
+            }
+            for check_colour in minority_chromatic:
+                run = 0
+                for c in range(COLS):
+                    if (cell_type[c] in (CELL_GRAPHICS, CELL_WHITE_GFX)
+                            and cell_colour[c] == check_colour):
+                        run += 1
+                        if run >= 3:
+                            return None
+                    else:
+                        run = 0
         return leading_colour
 
     return None

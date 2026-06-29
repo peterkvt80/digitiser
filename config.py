@@ -124,10 +124,12 @@ DIGITISER = {
     # Gate 3 (min-lum): The darkest pixel in the cell must be below
     #         text_min_lum.  Spurious OCR hits on near-white noise cells
     #         never have a genuinely dark pixel; real pencil strokes always do.
-    #         Set to 100 — pencil text and grey shading (clouds, mountains)
-    #         reach below 100 in the darkest part of the stroke; paper grain
-    #         stays above ~180.  Spurious colour from grey shading is prevented
-    #         by _pick_row_bg requiring 60% coverage, not by this gate.
+    #         Set to 100 — real pencil strokes reach raw_min ≈ 40–80;
+    #         graph-paper grid-line intersections and near-blank cells measure
+    #         raw_min ≈ 95–115.  The current value of 100 sits in the gap.
+    #         If OCR false positives reappear (raw_min just below 100), raise
+    #         to 110 — but first verify that genuine pencil text on your sheet
+    #         has raw_min < 90 to confirm a safe gap exists.
     "text_spread_threshold": 100,  # min lum spread to even consider a cell as TEXT
     "min_ink_pixels":    20,   # fewer absolute dark pixels than this → EMPTY
     "noise_spread_limit": 60,  # spread below this → EMPTY (dot-grid noise gate)
@@ -136,21 +138,25 @@ DIGITISER = {
     # white_gfx_fill_threshold : fraction of cell pixels below sixel_fill_threshold
     #     that must be dark to qualify as achromatic (white) graphics.
     #
-    #     Graph paper lines (0.3–0.5 mm on a 5 mm grid, roughly the same pitch as
-    #     one teletext cell) cross every cell and alone contribute ~30–40% dark
-    #     pixel coverage.  The old value of 0.30 fired on every boundary cell of a
-    #     drawing where pencil was thin and grid lines dominated, producing spurious
-    #     white graphics codes throughout the TTI.
+    #     IMPORTANT: this threshold is applied to the PRE-CLAHE (raw) greyscale
+    #     patch, not the CLAHE-processed patch.  CLAHE massively inflates fill
+    #     fractions on blank paper (empty cell: raw ≈14%, CLAHE ≈69%), so using
+    #     CLAHE grey for fill_frac made the gate fire on graph-paper lines and
+    #     horse outline strokes that are not genuinely shaded cells.
     #
-    #     0.50 requires more than half the cell to be dark — genuine achromatic
-    #     shading reliably reaches 60–80% fill; graph lines alone cannot exceed ~40%.
-    #     Lower this only if you are using very dense grey/white pencil shading.
+    #     Measured on raw grey with sixel_fill_threshold=200:
+    #       empty paper:           ≈ 0.03–0.15
+    #       black outline stroke:  ≈ 0.05–0.35
+    #       genuine grey shading:  ≈ 0.35–0.80
+    #
+    #     0.50 sits well above the outline/paper band and below genuine shading.
+    #     Lower this only if you are using very light grey/white pencil shading.
     #
     # white_gfx_max_saturation : mean HSV saturation of ink pixels must be below
     #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
     #     the colour classifier requires avg_s >= 50, so 40 sits safely below
     #     that with a 10-unit gap.
-    "white_gfx_fill_threshold": 0.35,
+    "white_gfx_fill_threshold": 0.50,
     "white_gfx_max_saturation":   40,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
