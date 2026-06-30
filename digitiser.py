@@ -1227,6 +1227,7 @@ def _process_grid(warped: np.ndarray, config: dict,
             #      used for coloured cells.
             wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.50)
             wgfx_max_sat     = config.get("white_gfx_max_saturation", 40)
+            wgfx_min_lum     = config.get("white_gfx_min_lum", 60)
 
             # Compute fill fraction on the PRE-CLAHE greyscale patch (pg_raw),
             # NOT the CLAHE-processed patch (pg).
@@ -1256,7 +1257,15 @@ def _process_grid(warped: np.ndarray, config: dict,
             s_pr   = hsv_pr[:, :, 1].astype(np.float32)
             avg_s  = float(s_pr.mean())
 
-            if fill_frac >= wgfx_fill_thresh and avg_s < wgfx_max_sat:
+            # Mean luminance guard: reject cells that are dark because the
+            # background itself is black (mean_lum_raw ≈ 0–40), not because
+            # they contain dense achromatic pencil shading on white paper.
+            # Genuine white-gfx cells (grey shading on paper) have
+            # mean_lum_raw ≈ 80–180; black-background cells measure ≈ 0–50.
+            # Threshold of 60 sits cleanly in the gap.
+            mean_lum_raw = float(pg_raw.mean())
+
+            if fill_frac >= wgfx_fill_thresh and avg_s < wgfx_max_sat and mean_lum_raw >= wgfx_min_lum:
                 sixel_char = _decode_sixels(
                     grey, y0, y1, x0c, x1c, cw, ch, sc, sr, sixel_thresh
                 )

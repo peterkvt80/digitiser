@@ -1399,6 +1399,7 @@ class _CellInspector(tk.Toplevel):
         self._sel_row   = 0
         self._sel_col   = 0
         self._highlight = None
+        self._view_mode = "photo"            # "photo" | "grid"
 
         self._build_ui()
         self._inspect_cell(0, 0)
@@ -1422,6 +1423,16 @@ class _CellInspector(tk.Toplevel):
                   relief=tk.FLAT, padx=8, cursor="hand2"
                   ).pack(side=tk.RIGHT, padx=10)
 
+        self._view_btn = tk.Button(
+            hdr, text="GRID VIEW",
+            command=self._toggle_view_mode,
+            font=("Courier", 10, "bold"),
+            fg="#000000", bg=C["cyan"],
+            activebackground=C["text"], activeforeground="#000000",
+            relief=tk.FLAT, padx=8, cursor="hand2",
+        )
+        self._view_btn.pack(side=tk.RIGHT, padx=6)
+
         body = tk.Frame(self, bg=C["bg"])
         body.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -1432,9 +1443,8 @@ class _CellInspector(tk.Toplevel):
         )
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._photo = ImageTk.PhotoImage(self._warped)
-        self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
-        self._draw_grid_overlay()
+        self._photo = None   # held to prevent GC
+        self._render_canvas()
 
         self._canvas.bind("<Button-1>", self._on_click)
         self.bind("<Left>",  lambda _: self._step(0, -1))
@@ -1512,6 +1522,127 @@ class _CellInspector(tk.Toplevel):
             y = int(row * ch)
             colour = accent if row % 5 == 0 else line_col
             self._canvas.create_line(0, y, self.DISP_W, y, fill=colour, width=1)
+
+    # ── View mode toggle ──────────────────────────────────────────────────────
+
+    def _toggle_view_mode(self):
+        if self._view_mode == "photo":
+            self._view_mode = "grid"
+            self._view_btn.config(text="PHOTO VIEW", bg=C["yellow"])
+        else:
+            self._view_mode = "photo"
+            self._view_btn.config(text="GRID VIEW",  bg=C["cyan"])
+        self._render_canvas()
+        self._draw_highlight(self._sel_row, self._sel_col)
+
+    def _render_canvas(self):
+        """Redraw the main canvas in either photo or grid view."""
+        self._canvas.delete("all")
+        self._highlight = None
+        if self._view_mode == "photo":
+            self._photo = ImageTk.PhotoImage(self._warped)
+            self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+            self._draw_grid_overlay()
+        else:
+            self._photo = None
+            self._draw_grid_view()
+
+    def _draw_grid_view(self):
+        """
+        Render a 40×24 cell map from scan_data, showing exactly what ink was
+        captured before any TTI control-code/background logic is applied.
+
+        The cell background is ALWAYS BLACK — matching the teletext default
+        background and the physical white paper showing through as "no ink".
+        Ink (set sixel sub-cells, or OCR text) is drawn in the cell's own
+        classified colour.  This is the inverse of an earlier version that
+        coloured the whole cell and drew ink in a contrasting colour — that
+        produced a colour-filled silhouette with the actual drawn shape
+        appearing as the "empty" hue, which is backwards from what the pencil
+        marks on the page actually show.
+
+          TEXT cells     — OCR character drawn in white on black
+          GRAPHICS cells — 2×3 sixel bitmask: ink sub-cells (frac >= 0.25)
+                           filled with the cell's colour, paper sub-cells
+                           left black
+          WHITE_GFX      — 2×3 bitmask: ink sub-cells filled white, rest black
+          EMPTY          — solid black, no label
+
+        When scan_data is unavailable every cell is black with a dim "?".
+        """
+        from digitiser import CELL_EMPTY, CELL_TEXT, CELL_GRAPHICS, CELL_WHITE_GFX
+
+        SUBCELL_FILL_FRAC = 0.25   # must match _decode_sixels / _draw_sixel_bitmask
+
+        cw = self.DISP_W / self.COLS
+        ch = self.DISP_H / self.ROWS
+
+        # Ink colour per classified colour name (drawn only where ink is present)
+        _INK = {
+            "RED":     "#ff3333", "GREEN":   "#33ff33", "YELLOW":  "#ffff33",
+            "BLUE":    "#3333ff", "MAGENTA": "#ff33ff", "CYAN":    "#33ffff",
+            "WHITE":   "#ffffff", "BLACK":   "#888888", "NONE":    "#888888",
+        }
+        _BLACK = "#0a0a0a"
+
+        font_size = max(6, min(int(ch * 0.65), int(cw * 0.9), 18))
+        font_spec = ("Courier", font_size, "bold")
+
+        for row in range(self.ROWS):
+            for col in range(self.COLS):
+                x0 = int(col * cw);  x1 = int((col + 1) * cw)
+                y0 = int(row * ch);  y1 = int((row + 1) * ch)
+                xc = (x0 + x1) / 2;  yc = (y0 + y1) / 2
+
+                # Cell background is always black — paper/no-ink = black,
+                # matching both the teletext default bg and physical paper.
+                self._canvas.create_rectangle(x0, y0, x1, y1,
+                                               fill=_BLACK, outline="#222222")
+
+                if self._scan_data is None:
+                    self._canvas.create_text(xc, yc, text="?",
+                                             font=font_spec, fill="#444444")
+                    continue
+
+                d  = self._scan_data[row][col]
+                ct = d["cell_type"]
+
+                if ct == CELL_EMPTY:
+                    continue   # solid black, no label
+
+                elif ct == CELL_TEXT:
+                    ch_char = d.get("ocr_char", " ") or " "
+                    if ch_char.strip():
+                        self._canvas.create_text(xc, yc, text=ch_char.upper(),
+                                                  font=font_spec, fill="#ffffff")
+
+                elif ct in (CELL_GRAPHICS, CELL_WHITE_GFX):
+                    colour       = d["colour"]
+                    subcell_fill = d["subcell_fill"]
+                    ink_hex      = "#ffffff" if ct == CELL_WHITE_GFX else _INK.get(colour, "#ffffff")
+                    inset = max(1, int(min(cw, ch) * 0.06))
+                    bw = (x1 - x0 - 2 * inset) / 2
+                    bh_sub = (y1 - y0 - 2 * inset) / 3
+                    for bit_idx, (sr_i, sc_i) in enumerate(
+                        [(r, c) for r in range(3) for c in range(2)]
+                    ):
+                        frac = subcell_fill[bit_idx] if bit_idx < len(subcell_fill) else 0.0
+                        if frac < SUBCELL_FILL_FRAC:
+                            continue   # leave as black background — no rectangle needed
+                        bx0 = x0 + inset + sc_i * bw
+                        by0 = y0 + inset + sr_i * bh_sub
+                        self._canvas.create_rectangle(
+                            bx0, by0, bx0 + bw, by0 + bh_sub,
+                            fill=ink_hex, outline="",
+                        )
+
+        # Grid lines over the top
+        for col in range(1, self.COLS):
+            self._canvas.create_line(int(col * cw), 0, int(col * cw), self.DISP_H,
+                                      fill="#333333", width=1)
+        for row_i in range(1, self.ROWS):
+            self._canvas.create_line(0, int(row_i * ch), self.DISP_W, int(row_i * ch),
+                                      fill="#333333", width=1)
 
     def _draw_highlight(self, row: int, col: int):
         cw = self.DISP_W / self.COLS
@@ -1881,13 +2012,16 @@ class _CellInspector(tk.Toplevel):
     def _draw_sixel_bitmask(self, subcell_fill: list, bits: int,
                              sixel_colours: "list[str] | None" = None):
         """
-        Draw a 2×3 sixel bitmask diagram.
+        Draw a 2×3 sixel bitmask diagram showing what is physically in the cell.
 
-        When ``sixel_colours`` is supplied each sub-cell is filled with its
-        detected teletext colour (set sub-cells) or a dimmed version of the
-        background colour (unset sub-cells).  When absent the old behaviour
-        is used: set=green, unset=dim-green gradient.
+        Each sub-cell is lit when its raw ink fill fraction exceeds
+        SUBCELL_FILL_FRAC (0.25), matching the threshold used by _decode_sixels.
+        This always reflects actual ink on paper regardless of any row-background
+        inversion applied to the TTI bits field.  The ``bits`` value (which may
+        be inverted) is still shown in the ANALYSIS text panel for TTI debugging.
         """
+        SUBCELL_FILL_FRAC = 0.25   # must match _decode_sixels
+
         c = self._sixel_canvas
         c.delete("all")
         cw = 120;  ch = 90
@@ -1903,7 +2037,7 @@ class _CellInspector(tk.Toplevel):
             y1 = y0 + bh - gap * 2
 
             frac = subcell_fill[bit_idx] if bit_idx < len(subcell_fill) else 0.0
-            on   = bool(bits & (1 << bit_idx))
+            on   = frac >= SUBCELL_FILL_FRAC   # ink-driven, not bits-driven
 
             if sixel_colours is not None and bit_idx < len(sixel_colours):
                 sc_name = sixel_colours[bit_idx]

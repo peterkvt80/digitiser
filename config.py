@@ -156,8 +156,17 @@ DIGITISER = {
     #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
     #     the colour classifier requires avg_s >= 50, so 40 sits safely below
     #     that with a 10-unit gap.
+    #
+    # white_gfx_min_lum : mean raw luminance of the cell must be AT OR ABOVE this
+    #     to qualify as white-gfx.  Black-background cells have mean_lum_raw ≈ 0–50
+    #     (the cell is dark because the background is dark, not because of dense
+    #     pencil shading).  Genuine white-gfx cells contain dark shading on bright
+    #     paper, giving mean_lum_raw ≈ 80–180.  Threshold of 60 rejects black-
+    #     background cells that would otherwise pass fill_frac (fill ≈100% because
+    #     everything is dark) and avg_s (≈0 because black has no saturation).
     "white_gfx_fill_threshold": 0.50,
     "white_gfx_max_saturation":   40,
+    "white_gfx_min_lum":          60,
 
     # Border bleed guard.  The printed grid border (6px at 300 DPI, drawn with
     # cv2.rectangle which centres the stroke on the boundary) bleeds its inner
