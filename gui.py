@@ -320,7 +320,8 @@ class TeletextGUI(tk.Tk):
             bg=C["entry_bg"], fg=C["green"],
             font=("Courier", 12),
             selectbackground=C["panel"], selectforeground=C["text"],
-            activestyle="none", height=12
+            activestyle="none", height=12,
+            exportselection=False,
         )
         lb_sb = tk.Scrollbar(list_frame, command=self._gallery_lb.yview)
         self._gallery_lb.configure(yscrollcommand=lb_sb.set)
@@ -328,13 +329,47 @@ class TeletextGUI(tk.Tk):
         lb_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._gallery_lb.bind("<Double-Button-1>", lambda _: self._load_gallery_entry())
 
-        # Gallery thumbnail
-        self._thumb_label = tk.Label(
-            self._tab_gallery, bg=C["bg"],
-            text="", width=32, height=10
-        )
-        self._thumb_label.pack(pady=4)
+        # Gallery thumbnail.
+        # tk.Label's width/height options are character units unless an
+        # `image` is currently configured, in which case Tk reinterprets
+        # them as pixels — and reverts to character units again the moment
+        # the image is cleared (e.g. on delete).  Sizing the Label itself
+        # would make the layout balloon to ~320 characters wide whenever no
+        # thumbnail is shown.  Wrapping it in a fixed-size Frame with
+        # pack_propagate(False) keeps the on-screen footprint constant
+        # (matching the thumbnail's capped display size of 320x150)
+        # regardless of whether an image is currently set.
+        thumb_frame = tk.Frame(self._tab_gallery, bg=C["bg"],
+                               width=320, height=150)
+        thumb_frame.pack(pady=4)
+        thumb_frame.pack_propagate(False)
+
+        self._thumb_label = tk.Label(thumb_frame, bg=C["bg"], text="")
+        self._thumb_label.pack(fill=tk.BOTH, expand=True)
         self._gallery_lb.bind("<<ListboxSelect>>", self._on_gallery_select)
+
+        # Notes editor — edits meta.json "notes" for the selected page.
+        # The same notes also appear in the listbox description (display_name).
+        notes_frame = tk.Frame(self._tab_gallery, bg=C["bg"])
+        notes_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        tk.Label(notes_frame, text="NOTES:",
+                 font=("Courier", 10, "bold"), fg=C["yellow"], bg=C["bg"]
+                 ).pack(side=tk.LEFT)
+
+        self._notes_var = tk.StringVar(value="")
+        self._notes_entry = tk.Entry(
+            notes_frame, textvariable=self._notes_var,
+            font=("Courier", 10), bg=C["entry_bg"], fg=C["green"],
+            insertbackground=C["green"], relief=tk.FLAT,
+            exportselection=False,
+        )
+        self._notes_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._notes_entry.bind("<Return>", lambda _: self._save_notes())
+
+        self._make_btn(notes_frame, "SAVE NOTES",
+                       self._save_notes, fg="#000000", bg=C["green"]
+                       ).pack(side=tk.LEFT)
 
         # Gallery buttons
         btn_row = tk.Frame(self._tab_gallery, bg=C["bg"])
@@ -1056,6 +1091,30 @@ class TeletextGUI(tk.Tk):
                 self._thumb_label.image = photo
             except Exception:
                 pass
+        self._notes_var.set(entry.notes if entry else "")
+
+    def _save_notes(self):
+        """Persist the NOTES field to meta.json for the selected gallery entry."""
+        idx = self._gallery_lb.curselection()
+        if not idx:
+            messagebox.showinfo("Select a Page", "Click a page to select it first.")
+            return
+        entry = self._gallery.get_entry(idx[0])
+        if entry is None:
+            return
+        try:
+            self._gallery.update_notes(entry, self._notes_var.get().strip())
+            sel = idx[0]
+            self._refresh_gallery()
+            # Re-select the same row so the listbox description (which now
+            # includes the new notes) and the notes field stay in sync.
+            self._gallery_lb.selection_clear(0, tk.END)
+            self._gallery_lb.selection_set(sel)
+            self._gallery_lb.see(sel)
+            self._on_gallery_select()
+            self._set_status(f"Notes saved for P{entry.page_number:03d}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
 
     def _load_gallery_entry(self):
         idx = self._gallery_lb.curselection()
@@ -1185,12 +1244,51 @@ class TeletextGUI(tk.Tk):
         self._hw.on_button("BTN_NEXT",    self._hw_next)
         self._hw.on_button("BTN_PREV",    self._hw_prev)
 
-        # Also bind keyboard shortcuts for development convenience
-        self.bind("<space>",    lambda _: self._do_capture())
-        self.bind("<Return>",   lambda _: self._do_save())
-        self.bind("<Escape>",   lambda _: self._hw_cancel())
-        self.bind("<Right>",    lambda _: self._hw_next())
-        self.bind("<Left>",     lambda _: self._hw_prev())
+        # Also bind keyboard shortcuts for development convenience.
+        #
+        # Tk widget key-bindings don't stop propagation by default, so a
+        # plain self.bind(...) on the root window still fires even while the
+        # user is typing in an Entry/Text widget elsewhere in the GUI (e.g.
+        # the Gallery tab's NOTES field).  Without a guard, typing a space
+        # while editing notes triggers CAPTURE, and pressing Enter to commit
+        # the notes triggers SAVE TO GALLERY — both unrelated to the field
+        # being edited.  Each handler below checks focus first and is a
+        # no-op while an Entry/Text widget has keyboard focus.
+        self.bind("<space>",    self._kb_capture)
+        self.bind("<Return>",   self._kb_save)
+        self.bind("<Escape>",   self._kb_cancel)
+        self.bind("<Right>",    self._kb_next)
+        self.bind("<Left>",     self._kb_prev)
+
+    def _typing_in_text_widget(self) -> bool:
+        """True if keyboard focus is currently in an Entry/Text/Spinbox widget."""
+        focused = self.focus_get()
+        return isinstance(focused, (tk.Entry, tk.Text, tk.Spinbox))
+
+    def _kb_capture(self, _event=None):
+        if self._typing_in_text_widget():
+            return
+        self._do_capture()
+
+    def _kb_save(self, _event=None):
+        if self._typing_in_text_widget():
+            return
+        self._do_save()
+
+    def _kb_cancel(self, _event=None):
+        if self._typing_in_text_widget():
+            return
+        self._hw_cancel()
+
+    def _kb_next(self, _event=None):
+        if self._typing_in_text_widget():
+            return
+        self._hw_next()
+
+    def _kb_prev(self, _event=None):
+        if self._typing_in_text_widget():
+            return
+        self._hw_prev()
 
     def _hw_cancel(self):
         """Cancel current action or go back to capture tab."""

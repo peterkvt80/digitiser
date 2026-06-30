@@ -40,6 +40,10 @@ class GalleryEntry:
         return self.meta.get("timestamp", "")
 
     @property
+    def notes(self) -> str:
+        return self.meta.get("notes", "")
+
+    @property
     def tti_path(self) -> Path:
         return self.path / "page.tti"
 
@@ -54,7 +58,76 @@ class GalleryEntry:
 
     def display_name(self) -> str:
         ts = self.timestamp[:16].replace("T", " ") if self.timestamp else "Unknown"
-        return f"P{self.page_number:03d}  {ts}"
+        base = f"P{self.page_number:03d}  {ts}"
+        if self.notes:
+            base += f"  — {self.notes}"
+        return base
+
+    def update_notes(self, notes: str):
+        """
+        Update the notes field for this entry and persist it to meta.json.
+        Updates self.meta in place so the in-memory GalleryEntry (and any
+        cached reference to it, e.g. in GalleryManager._entries) reflects
+        the change immediately without requiring a full gallery reload.
+        """
+        self.meta["notes"] = notes
+        meta_file = self.path / "meta.json"
+        meta_file.write_text(json.dumps(self.meta, indent=2))
+        log.info("Updated notes for %s", self.path.name)
+
+
+# ── Sixel (block graphics) rendering helpers ──────────────────────────────────
+# Used by GalleryManager._make_thumbnail to draw graphics cells.  Mirrors
+# renderer.TeletextRenderer._draw_gfx_bitmask's reverse-mapping so a thumbnail
+# graphics cell renders identically to the fallback bitmask path of the live
+# Preview-tab canvas renderer.
+
+def _gfx_bits_from_char(ch: str) -> "int | None":
+    """
+    Reverse-map a parsed cell's display character back to its 6-bit sixel
+    pattern.  ``ch`` is whatever renderer.parse_tti_to_grid put in the
+    cell's 'char' field for a graphics cell: a teletext2.ttf PUA codepoint
+    (0xE680-0xE6FF) if the font was available when the grid was parsed, or
+    the raw 0x20-0x7F sixel byte otherwise.
+
+    Returns None if ch doesn't decode to a sixel pattern.
+    """
+    if not ch:
+        return None
+    code = ord(ch)
+    if 0xE680 <= code <= 0xE69F:
+        return code - 0xE680
+    elif 0xE6A0 <= code <= 0xE6BF:
+        return code - 0xE6A0
+    elif 0xE6C0 <= code <= 0xE6DF:
+        return (code - 0xE6C0) | 0x20
+    elif 0xE6E0 <= code <= 0xE6FF:
+        return (code - 0xE6E0) | 0x20
+    elif 0x20 <= code <= 0x3F:
+        return code & 0x1F
+    elif 0x60 <= code <= 0x7F:
+        return code & 0x3F
+    return None
+
+
+def _draw_sixel_block(draw: "ImageDraw.ImageDraw", x0: int, y0: int,
+                      x1: int, y1: int, bits: int, fill_hex: str):
+    """
+    Draw a 2×3 grid of filled rectangles for the set sixel bits within the
+    cell bounds (x0,y0)-(x1,y1).
+
+    Bit layout: bit0=TL bit1=TR bit2=ML bit3=MR bit4=BL bit5=BR
+    """
+    cw   = x1 - x0
+    ch_h = y1 - y0
+    for bit_idx, (cx, cy) in enumerate(
+            [(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]):
+        if bits & (1 << bit_idx):
+            rx0 = x0 + (cx * cw) // 2
+            ry0 = y0 + (cy * ch_h) // 3
+            rx1 = x0 + ((cx + 1) * cw) // 2
+            ry1 = y0 + ((cy + 1) * ch_h) // 3
+            draw.rectangle([rx0, ry0, rx1, ry1], fill=fill_hex)
 
 
 class GalleryManager:
@@ -145,6 +218,10 @@ class GalleryManager:
         self.refresh()
         log.info("Deleted %s", entry.path)
 
+    def update_notes(self, entry: GalleryEntry, notes: str):
+        """Edit the notes field of an existing gallery entry in place."""
+        entry.update_notes(notes)
+
     def entries(self) -> list:
         return list(self._entries)
 
@@ -163,6 +240,13 @@ class GalleryManager:
         """
         Generate a 320×240 thumbnail using the renderer's parser so that
         ESC-encoded control codes and colour state are handled correctly.
+
+        Both text (alphanumeric) and graphics (sixel block) cells are
+        rendered, matching what the live TeletextRenderer canvas shows in
+        the Preview tab.  Graphics cells are drawn as a 2×3 grid of filled
+        rectangles for the set sixel bits — the same fallback bitmask
+        approach renderer.TeletextRenderer uses when teletext2.ttf isn't
+        available, which works fine even at thumbnail-cell pixel sizes.
         """
         from renderer import parse_tti_to_grid, COLOURS
 
@@ -203,9 +287,14 @@ class GalleryManager:
                 draw.rectangle([x0, y0, x1, y1], fill=bg_hex)
 
                 ch = cell['char']
-                # Only draw printable ASCII text characters (skip spaces,
-                # control positions, and PUA graphics — too small to render)
-                if ch and ch != ' ' and not cell['graphics'] and 0x20 <= ord(ch) <= 0x7E:
+                if not ch or ch == ' ':
+                    continue
+
+                if cell['graphics']:
+                    bits = _gfx_bits_from_char(ch)
+                    if bits:
+                        _draw_sixel_block(draw, x0, y0, x1, y1, bits, fg_hex)
+                elif 0x20 <= ord(ch) <= 0x7E:
                     draw.text((x0, y0), ch, fill=fg_hex, font=font)
 
         return img
