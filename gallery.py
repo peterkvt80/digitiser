@@ -19,6 +19,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger(__name__)
 
+# Teletext-legal page number range (3-digit page numbers; 1xx-8xx is the
+# conventional user-page range — 9xx is reserved on many transmission
+# systems, so it's excluded here).
+PAGE_NUMBER_MIN = 100
+PAGE_NUMBER_MAX = 899
+
 
 class GalleryEntry:
     def __init__(self, path: Path):
@@ -52,8 +58,19 @@ class GalleryEntry:
         return self.path / "thumb.png"
 
     def load_tti(self) -> str:
+        """
+        Load page.tti's exact text content.
+
+        Opened with newline="" (i.e. universal-newline translation
+        disabled) so the file's line endings come back exactly as stored
+        on disk — \\r\\n, with no extra translation in either direction.
+        Without this, Path.read_text()'s default text-mode behaviour
+        normalises any \\r\\n / \\r / \\n in the file to a bare \\n, which
+        silently strips the \\r teletext hardware and TTI consumers expect.
+        """
         if self.tti_path.exists():
-            return self.tti_path.read_text(encoding="latin-1")
+            with open(self.tti_path, "r", encoding="latin-1", newline="") as f:
+                return f.read()
         return ""
 
     def display_name(self) -> str:
@@ -74,6 +91,18 @@ class GalleryEntry:
         meta_file = self.path / "meta.json"
         meta_file.write_text(json.dumps(self.meta, indent=2))
         log.info("Updated notes for %s", self.path.name)
+
+    def _set_page_number(self, page_number: int):
+        """
+        Internal: write a new page_number into meta.json without any
+        validation.  Validation (range + uniqueness) is the responsibility
+        of GalleryManager.update_page_number — this method just persists
+        the value once the caller has already confirmed it is legal.
+        """
+        self.meta["page_number"] = page_number
+        meta_file = self.path / "meta.json"
+        meta_file.write_text(json.dumps(self.meta, indent=2))
+        log.info("Updated page number for %s to P%03d", self.path.name, page_number)
 
 
 # ── Sixel (block graphics) rendering helpers ──────────────────────────────────
@@ -128,6 +157,55 @@ def _draw_sixel_block(draw: "ImageDraw.ImageDraw", x0: int, y0: int,
             rx1 = x0 + ((cx + 1) * cw) // 2
             ry1 = y0 + ((cy + 1) * ch_h) // 3
             draw.rectangle([rx0, ry0, rx1, ry1], fill=fill_hex)
+
+
+def _edit_tti_for_publish(tti_content: str, page_number: int, notes: str) -> str:
+    """
+    Apply the on-air edits to a TTI file's text for publishing:
+
+      DE,...  →  DE,<notes>
+          The description line is replaced with the page's notes, so the
+          on-air copy carries a human-readable description (e.g. the
+          artist/title) instead of the generic "Captured by TDI620
+          Digitiser" text written at capture time.
+
+      PN,...  →  PN,<page_number>00
+          The page number field is replaced with the gallery page number
+          followed by two trailing zero digits — the standard 5-digit TTI
+          PN representation (e.g. page 105 → "PN,10500").
+
+    Only the first DE line and first PN line are edited — TTI files
+    produced by this app have exactly one of each, written by
+    digitiser._build_tti.  Other lines (DS, SP, CT, PS, MS, SC, CS, OL,...)
+    are passed through unchanged.
+
+    ``tti_content`` may use "\\r\\n", "\\n", "\\r", or even a corrupted
+    "\\r\\r\\n" (as produced by the pre-fix Windows double-newline-
+    translation bug — see GalleryManager.save()/GalleryEntry.load_tti())
+    line ending.  "\\r\\r\\n" is normalised to "\\r\\n" first: left as-is,
+    ``splitlines()`` would treat the lone leading "\\r" as its own line
+    boundary and turn every corrupted line into two (one blank), which
+    would propagate the corruption into the published file instead of
+    fixing it.  The output is always re-joined with "\\r\\n" (with a
+    trailing "\\r\\n"), matching the format digitiser._build_tti produces,
+    so on-air files always have correct, consistent TTI line endings
+    regardless of the condition of the source file.
+    """
+    tti_content = tti_content.replace("\r\r\n", "\r\n")   # heal legacy corruption
+    lines = tti_content.splitlines()
+    de_done = pn_done = False
+    new_lines = []
+    for line in lines:
+        if not de_done and line.startswith("DE,"):
+            new_lines.append(f"DE,{notes}")
+            de_done = True
+            continue
+        if not pn_done and line.startswith("PN,"):
+            new_lines.append(f"PN,{page_number}00")
+            pn_done = True
+            continue
+        new_lines.append(line)
+    return "\r\n".join(new_lines) + "\r\n"
 
 
 class GalleryManager:
@@ -191,9 +269,17 @@ class GalleryManager:
         entry_dir = self._dir / folder_name
         entry_dir.mkdir(parents=True)
 
-        # Write TTI
+        # Write TTI.
+        # newline="" disables Python's text-mode newline translation, which
+        # would otherwise double every \r\n the content already contains
+        # into \r\r\n on Windows (where the platform line separator is
+        # \r\n, so each embedded \n gets re-translated to \r\n on top of
+        # the existing \r).  On Linux this happens to be a no-op, which is
+        # why the bug was Windows-only.  newline="" makes the write
+        # byte-identical on every platform.
         tti_path = entry_dir / "page.tti"
-        tti_path.write_text(tti_content, encoding="latin-1")
+        with open(tti_path, "w", encoding="latin-1", newline="") as f:
+            f.write(tti_content)
 
         # Write metadata
         meta = {
@@ -222,6 +308,93 @@ class GalleryManager:
         """Edit the notes field of an existing gallery entry in place."""
         entry.update_notes(notes)
 
+    def update_page_number(self, entry: GalleryEntry, new_page_number: int):
+        """
+        Change the page number of an existing gallery entry.
+
+        Enforces two rules required for a valid teletext page number:
+          1. Range — must be between PAGE_NUMBER_MIN (100) and
+             PAGE_NUMBER_MAX (899) inclusive.  Teletext page numbers are
+             3 hex/decimal digits; 1xx-8xx is the conventional user-page
+             range (9xx is reserved on many transmission systems).
+          2. Uniqueness — no other entry currently in the gallery may
+             already use this page number.
+
+        Raises
+        ------
+        ValueError
+            If the requested page number fails either check.  The message
+            is suitable for direct display to the user.
+
+        Notes
+        -----
+        Only meta.json is updated — the on-disk folder name (which embeds
+        the page number purely for human readability when browsing the
+        filesystem) is left untouched.  GalleryEntry.page_number always
+        reads from meta.json, so this is sufficient to make the change
+        take effect everywhere in the app (listbox, thumbnails, next-page
+        allocation in refresh()).
+        """
+        if not isinstance(new_page_number, int) or isinstance(new_page_number, bool):
+            raise ValueError("Page number must be a whole number.")
+
+        if not (PAGE_NUMBER_MIN <= new_page_number <= PAGE_NUMBER_MAX):
+            raise ValueError(
+                f"Page number must be between {PAGE_NUMBER_MIN} and "
+                f"{PAGE_NUMBER_MAX} (teletext page numbers are 3 digits, "
+                f"1xx-8xx)."
+            )
+
+        for other in self._entries:
+            if other.path != entry.path and other.page_number == new_page_number:
+                raise ValueError(
+                    f"Page number {new_page_number} is already used by "
+                    f"another saved page ({other.display_name()})."
+                )
+
+        entry._set_page_number(new_page_number)
+        self.refresh()
+        log.info("Renumbered %s → P%03d", entry.path.name, new_page_number)
+
+    def publish_all(self) -> list:
+        """
+        Publish every saved gallery page to <gallery_dir>/onair/.
+
+        For each entry, page.tti is copied with two edits applied (see
+        _edit_tti_for_publish): the DE line is replaced with the page's
+        notes, and the PN line is replaced with the page number plus two
+        trailing zeros.  The edited copy is written to
+        ``onair/p<page_number>.tti`` (e.g. page 105 → ``onair/p105.tti``).
+
+        Republishing is idempotent — existing files for the same page
+        number are simply overwritten with the latest content.
+
+        Returns
+        -------
+        list[Path]
+            The onair file paths written, in gallery listing order.
+        """
+        onair_dir = self._dir / "onair"
+        onair_dir.mkdir(parents=True, exist_ok=True)
+
+        written = []
+        for entry in self._entries:
+            tti_content = entry.load_tti()
+            if not tti_content:
+                log.warning("Skipping %s — page.tti missing or empty", entry.path.name)
+                continue
+            edited = _edit_tti_for_publish(tti_content, entry.page_number, entry.notes)
+            out_path = onair_dir / f"p{entry.page_number}.tti"
+            # newline="" — see the comment in save() for why this matters
+            # on Windows.
+            with open(out_path, "w", encoding="latin-1", newline="") as f:
+                f.write(edited)
+            written.append(out_path)
+            log.info("Published P%03d -> %s", entry.page_number, out_path)
+
+        log.info("Publish complete: %d page(s) written to %s", len(written), onair_dir)
+        return written
+
     def entries(self) -> list:
         return list(self._entries)
 
@@ -232,6 +405,55 @@ class GalleryManager:
 
     def count(self) -> int:
         return len(self._entries)
+
+    def repair_corrupted_line_endings(self) -> list:
+        """
+        One-time repair for page.tti files saved before the Windows
+        double-newline-translation fix (see GalleryManager.save() and
+        GalleryEntry.load_tti()).
+
+        On Windows, the old code path opened page.tti in default text
+        mode, which translates every "\\n" to the platform line
+        separator on write.  Since the TTI content already contained
+        "\\r\\n" line endings, that translation turned each one into
+        "\\r\\r\\n" — an extra carriage return that most TTI/teletext
+        tools render as a blank line after every row.  Files saved on
+        Linux/Raspberry Pi OS were never affected (there "\\n" already
+        *is* the platform separator, so the translation was a no-op).
+
+        This scans every gallery entry's page.tti and, wherever
+        "\\r\\r\\n" is found, rewrites the file with "\\r\\r\\n"
+        collapsed back to "\\r\\n" — using the same newline="" binary-
+        safe write as save(), so the repair itself cannot reintroduce
+        the bug.  Files with no corruption are left untouched.
+
+        Returns
+        -------
+        list[Path]
+            The page.tti paths that were actually rewritten (i.e. were
+            found to be corrupted).  An empty list means nothing needed
+            repair.
+        """
+        repaired = []
+        for entry in self._entries:
+            tti_path = entry.tti_path
+            if not tti_path.exists():
+                continue
+            with open(tti_path, "rb") as f:
+                raw = f.read()
+            if b"\r\r\n" not in raw:
+                continue
+            fixed = raw.replace(b"\r\r\n", b"\r\n")
+            with open(tti_path, "wb") as f:
+                f.write(fixed)
+            repaired.append(tti_path)
+            log.info("Repaired corrupted line endings in %s", tti_path)
+
+        if repaired:
+            log.info("Line-ending repair: fixed %d file(s)", len(repaired))
+        else:
+            log.info("Line-ending repair: no corrupted files found")
+        return repaired
 
     # ── Thumbnail generation ──────────────────────────────────────────────────
 

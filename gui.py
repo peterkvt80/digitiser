@@ -311,6 +311,14 @@ class TeletextGUI(tk.Tk):
                        fg="#000000", bg=C["cyan"]
                        ).pack(side=tk.RIGHT)
 
+        self._make_btn(top, "PUBLISH ALL", self._publish_gallery,
+                       fg="#000000", bg=C["yellow"]
+                       ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self._make_btn(top, "REPAIR LINE ENDINGS", self._repair_line_endings,
+                       fg=C["text"], bg="#663300"
+                       ).pack(side=tk.RIGHT, padx=(0, 6))
+
         # Listbox
         list_frame = tk.Frame(self._tab_gallery, bg=C["bg"])
         list_frame.pack(fill=tk.BOTH, expand=True, padx=8)
@@ -347,6 +355,33 @@ class TeletextGUI(tk.Tk):
         self._thumb_label = tk.Label(thumb_frame, bg=C["bg"], text="")
         self._thumb_label.pack(fill=tk.BOTH, expand=True)
         self._gallery_lb.bind("<<ListboxSelect>>", self._on_gallery_select)
+
+        # Page number editor — edits meta.json "page_number" for the
+        # selected page.  Teletext-legal range 100-899, must be unique.
+        pagenum_frame = tk.Frame(self._tab_gallery, bg=C["bg"])
+        pagenum_frame.pack(fill=tk.X, padx=8, pady=(4, 0))
+
+        tk.Label(pagenum_frame, text="PAGE#:",
+                 font=("Courier", 10, "bold"), fg=C["yellow"], bg=C["bg"]
+                 ).pack(side=tk.LEFT)
+
+        self._pagenum_var = tk.StringVar(value="")
+        self._pagenum_entry = tk.Entry(
+            pagenum_frame, textvariable=self._pagenum_var,
+            font=("Courier", 10), bg=C["entry_bg"], fg=C["green"],
+            insertbackground=C["green"], relief=tk.FLAT, width=6,
+            exportselection=False,
+        )
+        self._pagenum_entry.pack(side=tk.LEFT, padx=6)
+        self._pagenum_entry.bind("<Return>", lambda _: self._save_page_number())
+
+        self._make_btn(pagenum_frame, "SAVE PAGE#",
+                       self._save_page_number, fg="#000000", bg=C["yellow"]
+                       ).pack(side=tk.LEFT)
+
+        tk.Label(pagenum_frame, text="(100-899, must be unique)",
+                 font=("Courier", 8), fg=C["dim"], bg=C["bg"]
+                 ).pack(side=tk.LEFT, padx=6)
 
         # Notes editor — edits meta.json "notes" for the selected page.
         # The same notes also appear in the listbox description (display_name).
@@ -1060,7 +1095,14 @@ class TeletextGUI(tk.Tk):
         )
         if path:
             try:
-                Path(path).write_text(self._current_tti, encoding="latin-1")
+                # newline="" disables text-mode newline translation — the
+                # same fix as GalleryManager.save().  Without it, on
+                # Windows every \n already embedded in self._current_tti
+                # gets re-translated to \r\n, turning the existing \r\n
+                # into \r\r\n (a stray blank line per row) in the exported
+                # file.
+                with open(path, "w", encoding="latin-1", newline="") as f:
+                    f.write(self._current_tti)
                 self._set_status(f"Exported to {path}")
             except Exception as e:
                 messagebox.showerror("Export Error", str(e))
@@ -1077,6 +1119,56 @@ class TeletextGUI(tk.Tk):
         count = self._gallery.count()
         self._set_status(f"Gallery: {count} page{'s' if count != 1 else ''}")
 
+    def _publish_gallery(self):
+        """
+        Copy every saved page to digitiser_gallery/onair/p<page_number>.tti,
+        editing the DE and PN lines from each page's notes and page number.
+        """
+        if self._gallery.count() == 0:
+            messagebox.showinfo("Nothing to Publish",
+                                "No saved pages in the gallery.")
+            return
+        try:
+            written = self._gallery.publish_all()
+        except Exception as e:
+            messagebox.showerror("Publish Error", str(e))
+            return
+        onair_dir = GALLERY_DIR / "onair"
+        self._set_status(f"Published {len(written)} page(s) to onair/")
+        messagebox.showinfo(
+            "Published",
+            f"Published {len(written)} page(s) to:\n{onair_dir}"
+        )
+
+    def _repair_line_endings(self):
+        """
+        One-time repair for page.tti files saved on Windows before the
+        newline-translation fix, which produced a stray "\\r\\r\\n" (an
+        extra blank line after every row) instead of "\\r\\n".  Safe to
+        run repeatedly — files that are already correct are left alone.
+        """
+        if self._gallery.count() == 0:
+            messagebox.showinfo("Nothing to Repair",
+                                "No saved pages in the gallery.")
+            return
+        try:
+            repaired = self._gallery.repair_corrupted_line_endings()
+        except Exception as e:
+            messagebox.showerror("Repair Error", str(e))
+            return
+        if repaired:
+            self._refresh_gallery()
+            self._set_status(f"Repaired line endings in {len(repaired)} page(s)")
+            messagebox.showinfo(
+                "Repair Complete",
+                f"Fixed corrupted line endings in {len(repaired)} page(s):\n\n"
+                + "\n".join(p.parent.name for p in repaired)
+            )
+        else:
+            self._set_status("No corrupted files found — nothing to repair")
+            messagebox.showinfo("Repair Complete",
+                                "No corrupted files found. All pages are OK.")
+
     def _on_gallery_select(self, _event=None):
         idx = self._gallery_lb.curselection()
         if not idx:
@@ -1092,6 +1184,7 @@ class TeletextGUI(tk.Tk):
             except Exception:
                 pass
         self._notes_var.set(entry.notes if entry else "")
+        self._pagenum_var.set(f"{entry.page_number:03d}" if entry else "")
 
     def _save_notes(self):
         """Persist the NOTES field to meta.json for the selected gallery entry."""
@@ -1115,6 +1208,46 @@ class TeletextGUI(tk.Tk):
             self._set_status(f"Notes saved for P{entry.page_number:03d}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
+
+    def _save_page_number(self):
+        """Persist the PAGE# field to meta.json for the selected gallery entry."""
+        idx = self._gallery_lb.curselection()
+        if not idx:
+            messagebox.showinfo("Select a Page", "Click a page to select it first.")
+            return
+        entry = self._gallery.get_entry(idx[0])
+        if entry is None:
+            return
+
+        raw = self._pagenum_var.get().strip()
+        try:
+            new_page = int(raw)
+        except ValueError:
+            messagebox.showerror("Invalid Page Number",
+                                 "Page number must be a whole number (100-899).")
+            return
+
+        try:
+            self._gallery.update_page_number(entry, new_page)
+        except ValueError as e:
+            messagebox.showerror("Invalid Page Number", str(e))
+            # Reset the field back to the entry's current (unchanged) value
+            self._pagenum_var.set(f"{entry.page_number:03d}")
+            return
+
+        sel = idx[0]
+        self._refresh_gallery()
+        # Re-locate the entry by path (list order is unaffected by page
+        # number changes since it's sorted by folder name, but be safe).
+        for i, e in enumerate(self._gallery.entries()):
+            if e.path == entry.path:
+                sel = i
+                break
+        self._gallery_lb.selection_clear(0, tk.END)
+        self._gallery_lb.selection_set(sel)
+        self._gallery_lb.see(sel)
+        self._on_gallery_select()
+        self._set_status(f"Page number updated to P{new_page:03d}")
 
     def _load_gallery_entry(self):
         idx = self._gallery_lb.curselection()
