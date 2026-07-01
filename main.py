@@ -30,13 +30,38 @@ args = parser.parse_args()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+#
+# On Windows, a plain logging.StreamHandler(sys.stdout) silently inherits
+# the *console's* active codepage (often cp1252), not UTF-8 — even though
+# sys.stdout itself was just wrapped as UTF-8 above. cp1252 has no glyph
+# for characters like '→' (U+2192), so any log message containing one
+# raises a UnicodeEncodeError inside logging's internal emit(). Python's
+# logging module catches that error itself (it never crashes the app),
+# but it prints a "--- Logging error ---" traceback and the original log
+# line is silently dropped.
+#
+# Fix (Option A): explicitly construct the console StreamHandler around
+# a text stream that is forced to UTF-8, with errors="backslashreplace"
+# so an unencodable character degrades gracefully instead of raising.
+
+_console_stream = io.TextIOWrapper(
+    sys.stdout.buffer,
+    encoding="utf-8",
+    errors="backslashreplace",
+    line_buffering=True,
+)
+_console_handler = logging.StreamHandler(_console_stream)
+
+_file_handler = logging.FileHandler(
+    Path.home() / "tdi620_digitiser.log",
+    encoding="utf-8",
+)
+
 logging.basicConfig(
     level=logging.DEBUG if args.debug else logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path.home() / "tdi620_digitiser.log"),
-    ]
+    handlers=[_console_handler, _file_handler],
 )
 log = logging.getLogger(__name__)
 log.info("TDI620 Digitiser starting up")
