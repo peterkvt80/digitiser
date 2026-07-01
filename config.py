@@ -147,10 +147,19 @@ DIGITISER = {
     #     Measured on raw grey with sixel_fill_threshold=200:
     #       empty paper:           ≈ 0.03–0.15
     #       black outline stroke:  ≈ 0.05–0.35
-    #       genuine grey shading:  ≈ 0.35–0.80
+    #       hand-drawn text:       <  0.25  (typically 0.05–0.20)
+    #       genuine grey shading:  ≈ 0.25–0.80
     #
-    #     0.50 sits well above the outline/paper band and below genuine shading.
-    #     Lower this only if you are using very light grey/white pencil shading.
+    #     0.25 is the text/graphite-shading boundary: hand-drawn pencil text
+    #     (letters, digits) covers less than 25% of a cell's area even for
+    #     bold block capitals, while a cell shaded solid with graphite pencil
+    #     reliably exceeds it.  Below 0.25 the cell falls through to the TEXT
+    #     classifier instead (see Step B in _process_grid); at or above 0.25
+    #     (with avg_s and mean_lum also passing) it is CELL_WHITE_GFX and is
+    #     never sent to Tesseract.  Raise this only if genuine graphite
+    #     shading on your sheets is being OCR'd as text (i.e. its fill
+    #     fraction is measuring below 0.25); lower it only if bold/dense
+    #     handwriting is being misclassified as shading.
     #
     # white_gfx_max_saturation : mean HSV saturation of ink pixels must be below
     #     this to confirm the ink is achromatic.  Grey pencil measures avg_s 6–24;
@@ -164,7 +173,7 @@ DIGITISER = {
     #     paper, giving mean_lum_raw ≈ 80–180.  Threshold of 60 rejects black-
     #     background cells that would otherwise pass fill_frac (fill ≈100% because
     #     everything is dark) and avg_s (≈0 because black has no saturation).
-    "white_gfx_fill_threshold": 0.50,
+    "white_gfx_fill_threshold": 0.25,
     "white_gfx_max_saturation":   40,
     "white_gfx_min_lum":          60,
 

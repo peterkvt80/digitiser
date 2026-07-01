@@ -71,8 +71,8 @@ White graphics (CELL_WHITE_GFX)
     1. Low saturation: avg_s < white_gfx_max_saturation (default 40)
        — rules out coloured pencils that happen to have high fill.
     2. High fill fraction: dark pixels / total pixels >= white_gfx_fill_threshold
-       (default 0.30, i.e. 30%)
-       — rules out text strokes (typically 5–20% fill) and blank paper.
+       (default 0.25, i.e. 25%)
+       — rules out text strokes (typically < 25% fill) and blank paper.
     3. At least one sixel sub-cell has non-zero fill
        — same empty-cell guard used for coloured graphics.
 
@@ -595,21 +595,7 @@ def _find_grid_corners_via_aruco(img: np.ndarray, config: dict) -> tuple:
     detector   = _make_detector(aruco_dict)
     grey       = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    found = {}
-    for preprocess in ("raw", "clahe", "adaptive"):
-        if len(found) == 4:
-            break
-        if preprocess == "raw":
-            proc = grey
-        elif preprocess == "clahe":
-            proc = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(grey)
-        else:
-            proc = cv2.adaptiveThreshold(grey, 255,
-                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 10)
-        for mid, corners in _detect_all_markers(proc, detector, corner_ids).items():
-            if mid not in found:
-                found[mid] = corners
-                log.debug("Marker %d found (%s)", mid, preprocess)
+    found = _detect_markers_multi_pass(grey, detector, corner_ids)
 
     if len(found) < 3:
         missing = [i for i in corner_ids if i not in found]
@@ -638,6 +624,87 @@ def _find_grid_corners_via_aruco(img: np.ndarray, config: dict) -> tuple:
              result[0,0],result[0,1], result[1,0],result[1,1],
              result[2,0],result[2,1], result[3,0],result[3,1])
     return result, found
+
+
+def _detect_markers_multi_pass(grey: np.ndarray, detector, wanted_ids: list) -> dict:
+    """
+    Run ArUco detection across three preprocessing passes and merge the
+    results, keeping the first successful detection of each marker ID:
+
+      1. raw       — unmodified greyscale
+      2. clahe     — local contrast normalisation (clipLimit=3.0, 8x8 tiles)
+      3. adaptive  — adaptive threshold (Gaussian, blockSize=51, C=10)
+
+    A single raw-greyscale pass alone reliably misses markers under uneven
+    illumination, glare, or the lower exposure/resolution typical of a live
+    preview stream — the CLAHE and adaptive-threshold passes recover most
+    of those.  This is the same multi-pass strategy the full capture
+    pipeline (_find_grid_corners_via_aruco) uses; sharing it here means the
+    live preview marker count (detect_aruco_marker_count) agrees with what
+    an actual capture would detect for the same physical scene, instead of
+    the preview under-reporting relative to capture.
+
+    Returns
+    -------
+    dict {marker_id: (4,2) float32 corner array}
+    """
+    found = {}
+    for preprocess in ("raw", "clahe", "adaptive"):
+        if len(found) >= len(wanted_ids):
+            break
+        if preprocess == "raw":
+            proc = grey
+        elif preprocess == "clahe":
+            proc = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(grey)
+        else:
+            proc = cv2.adaptiveThreshold(grey, 255,
+                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 10)
+        for mid, corners in _detect_all_markers(proc, detector, wanted_ids).items():
+            if mid not in found:
+                found[mid] = corners
+                log.debug("Marker %d found (%s)", mid, preprocess)
+    return found
+
+
+def detect_aruco_marker_count(pil_image: Image.Image, config: dict) -> int:
+    """
+    Quickly count how many of the four configured corner ArUco markers are
+    visible in a live preview frame.
+
+    Uses the same multi-pass detection (_detect_markers_multi_pass) as the
+    full capture pipeline, so a marker that would be found at capture time
+    is also found here — a single raw-greyscale pass was missing markers
+    under the preview stream's lower resolution/exposure that the actual
+    capture (which also tries CLAHE and adaptive-threshold) would have
+    caught.  Skipped: marker-interior exposure sampling and sub-pixel
+    corner refinement, since only a count is needed here, not corner
+    accuracy — this keeps it cheap enough to run several times a second.
+
+    Returns
+    -------
+    int
+        Number of the configured corner markers detected (0-4).  Returns 0
+        if OpenCV/ArUco or template_params are unavailable, or on any
+        detection error — the caller treats 0 as "not ready", which is the
+        safe default for gating a capture button.
+    """
+    if not _CV2:
+        return 0
+    tp = config.get("template_params")
+    if tp is None:
+        return 0
+    try:
+        dict_name  = tp.get("aruco_dict", "DICT_4X4_50")
+        corner_ids = tp.get("corner_ids", [0, 1, 2, 3])
+        aruco_dict = _get_aruco_dict(dict_name)
+        detector   = _make_detector(aruco_dict)
+        img_np = np.array(pil_image.convert("RGB"))
+        grey   = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        found  = _detect_markers_multi_pass(grey, detector, corner_ids)
+        return len(found)
+    except Exception as e:
+        log.debug("detect_aruco_marker_count failed: %s", e)
+        return 0
 
 
 def _detect_all_markers(grey, detector, wanted_ids) -> dict:
@@ -1209,23 +1276,28 @@ def _process_grid(warped: np.ndarray, config: dict,
             #      — already guaranteed by _classify_colour returning NONE, but
             #      we re-check explicitly for clarity and configurability.
             #   2. Overall dark-pixel fill fraction >= white_gfx_fill_threshold
-            #      — separates dense shading from text strokes AND from graph
-            #      paper grid lines.
+            #      — separates dense graphite shading from hand-drawn text.
             #
-            #      Graph paper lines (0.3–0.5mm on a 5mm grid, ≈ same pitch as
-            #      one teletext cell) cross every cell and contribute ~30–40% of
-            #      its area as dark pixels on their own.  The old default of 0.30
-            #      sat right at that level, causing every boundary cell of a
-            #      drawing (where pencil is thin and grid lines dominate) to fire
-            #      as CELL_WHITE_GFX even when the user drew no white shading.
+            #      Hand-drawn pencil text (letters, digits) covers less than
+            #      25% of a cell's area even for bold block capitals; a cell
+            #      shaded solid with graphite pencil reliably exceeds that.
+            #      A cell whose fill fraction lands below white_gfx_fill_threshold
+            #      falls through to the TEXT classifier (Step B below) instead
+            #      of being force-classified as shading and skipped from OCR —
+            #      this is what stops graphite-shaded cells from being sent to
+            #      Tesseract while still catching real text as TEXT.
             #
-            #      The new default of 0.50 requires more than half the cell to be
-            #      dark, which genuine achromatic shading reliably exceeds (60–
-            #      80% fill) while graph lines alone cannot.  Text strokes stay at
-            #      5–20%.  Update white_gfx_fill_threshold in config.py to match.
+            #      Note: graph-paper grid lines (0.3–0.5mm on a 5mm grid, ≈ same
+            #      pitch as one teletext cell) can themselves contribute ~30–40%
+            #      of a cell's dark-pixel fraction, so a threshold this close to
+            #      that band can occasionally catch a boundary cell of a thin-
+            #      pencil drawing where grid lines dominate.  If that happens,
+            #      raise white_gfx_fill_threshold slightly rather than dropping
+            #      it back toward the old 0.50 default, which was letting real
+            #      graphite shading fall through to OCR.
             #   3. At least one sixel sub-cell non-zero — same empty-cell guard
             #      used for coloured cells.
-            wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.50)
+            wgfx_fill_thresh = config.get("white_gfx_fill_threshold", 0.25)
             wgfx_max_sat     = config.get("white_gfx_max_saturation", 40)
             wgfx_min_lum     = config.get("white_gfx_min_lum", 60)
 
@@ -1243,9 +1315,11 @@ def _process_grid(warped: np.ndarray, config: dict,
             # honest ink coverage:
             #   empty paper:          raw fill ≈ 0.03–0.15
             #   black outline stroke: raw fill ≈ 0.05–0.35
-            #   genuine grey shading: raw fill ≈ 0.35–0.80
-            # A threshold of 0.50 (white_gfx_fill_threshold) cleanly separates
-            # genuine shading from outlines and blank paper.
+            #   hand-drawn text:      raw fill <  0.25  (typically 0.05–0.20)
+            #   genuine grey shading: raw fill ≈ 0.25–0.80
+            # A threshold of 0.25 (white_gfx_fill_threshold) is the text/
+            # graphite-shading boundary — see the config.py comment for the
+            # full rationale.
             #
             # Note: avg_s is still computed from the RGB patch (pr) which is
             # unaffected by CLAHE.  The mean saturation measurement is correct.

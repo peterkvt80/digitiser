@@ -11,6 +11,7 @@ Integrates with HardwareManager (GPIO buttons / LEDs) and LCDManager.
 
 import logging
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -18,7 +19,10 @@ from PIL import Image, ImageTk
 
 from config import DIGITISER, GALLERY_DIR, TTI_DEFAULTS, RENDERER
 from camera import Camera
-from digitiser import digitise, digitise_full, get_warped_image, GridNotFoundError, DigitiserError, load_calibration_for_config
+from digitiser import (
+    digitise, digitise_full, get_warped_image, GridNotFoundError,
+    DigitiserError, load_calibration_for_config, detect_aruco_marker_count,
+)
 from renderer import TeletextRenderer
 from gallery import GalleryManager
 from calibration import generate_chart, calibrate_from_image
@@ -76,6 +80,10 @@ class TeletextGUI(tk.Tk):
         self._current_scan_data: list | None = None
         self._gallery_index = 0
         self._processing = False
+
+        # Live ArUco marker count from the preview stream — used to gate
+        # the CAPTURE PAGE button (see _preview_grab_loop / _preview_display_pump).
+        self._aruco_marker_count = 0
 
         # Scanline overlay state
         self._tab_scan      = None
@@ -644,12 +652,30 @@ class TeletextGUI(tk.Tk):
         No sleep() here — we let OpenCV's own frame-rate gate the loop.
         When capturing a still we simply skip grabs so the camera isn't
         busy when grab_capture() is called from the worker thread.
+
+        ArUco marker detection (for the CAPTURE PAGE gating in
+        _preview_display_pump) runs here too, on a time-based throttle —
+        it's CPU-heavy enough (especially on a Pi) that running it on every
+        single preview frame would slow the grab loop down for no benefit;
+        a few checks a second is plenty responsive for a button state.
         """
+        ARUCO_CHECK_INTERVAL = 0.3   # seconds between marker-count checks
+        last_aruco_check = 0.0
+
         while not self._stop_preview.is_set():
             if not self.is_capturing:
                 frame = self._camera.grab_preview()
                 if frame is not None:
                     self._latest_frame = frame
+                    now = time.time()
+                    if now - last_aruco_check >= ARUCO_CHECK_INTERVAL:
+                        last_aruco_check = now
+                        try:
+                            self._aruco_marker_count = detect_aruco_marker_count(
+                                frame, DIGITISER
+                            )
+                        except Exception:
+                            pass
             else:
                 # Small yield while capturing so we don't spin the CPU
                 self._stop_preview.wait(timeout=0.05)
@@ -692,6 +718,23 @@ class TeletextGUI(tk.Tk):
                 self._calib_cam_label.configure(image=cal_photo, text="")
                 self._calib_cam_label.image = cal_photo
 
+            # ── ArUco marker gating for CAPTURE PAGE ──────────────────────────
+            # Only while the Capture tab is active and no capture/digitise is
+            # already in progress — otherwise this would fight with the
+            # explicit button-state and status changes made in
+            # _start_capture_pipeline / _on_digitise_success / _on_digitise_error.
+            if active == 0 and not self._processing:
+                count = self._aruco_marker_count
+                if count >= 4:
+                    self._btn_capture.config(state=tk.NORMAL)
+                    self._set_status("Ready — 4/4 ArUco markers detected")
+                else:
+                    self._btn_capture.config(state=tk.DISABLED)
+                    self._set_status(
+                        f"{count}/4 ArUco markers detected. "
+                        "Adjust framing to capture all markers."
+                    )
+
         self._preview_after_id = self.after(40, self._preview_display_pump)
 
     def _stop_preview_loop(self):
@@ -716,6 +759,16 @@ class TeletextGUI(tk.Tk):
             messagebox.showerror("No Camera",
                                  "No camera found.\nUse 'Load Image File'.")
             self.is_capturing = False
+            return
+        # Mirrors the CAPTURE PAGE button's enabled/disabled state (see
+        # _preview_display_pump) so the hardware button and keyboard
+        # shortcut can't trigger a capture the on-screen button wouldn't
+        # allow — all four corner markers must be visible first.
+        if self._aruco_marker_count < 4:
+            self._set_status(
+                f"{self._aruco_marker_count}/4 ArUco markers detected. "
+                "Adjust framing to capture all markers."
+            )
             return
         self.is_capturing = True
         self._start_capture_pipeline(source="camera")
